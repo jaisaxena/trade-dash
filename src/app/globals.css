@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --accent: 217 91% 45%;
+    --accent-muted: 217 91% 96%;
+    --border: 214.3 31.8% 91.4%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --accent: 217 91% 60%;
+    --accent-muted: 217 32% 17.5%;
+    --border: 217.2 32.6% 17.5%;
+  }
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  margin: 0;
+  min-height: 100vh;
+}
