@@ -16,6 +16,9 @@
     "react-dom": "^18.3.1",
     "tailwindcss": "^4.1.10"
   },
+  "overrides": {
+    "eslint-visitor-keys": "4.2.1"
+  },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",
     "@next/eslint-plugin-next": "^15.1.0",
