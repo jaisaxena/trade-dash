@@ -45,3 +45,15 @@ coverage/
 .nyc_output
 tmp/
 temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.duckdb
+*.duckdb.wal
+backend/.env
+backend/storage/market_data.duckdb
+backend/storage/strategies/*.json
