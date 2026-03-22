@@ -97,6 +97,7 @@ class OrderBook:
     def __init__(self) -> None:
         self.orders: dict[str, Order] = {}
         self.positions: dict[str, Position] = {}
+        self.realized_pnl: float = 0.0   # accumulated P&L from fully/partially closed trades
 
     def add_order(self, order: Order) -> Order:
         self.orders[order.id] = order
@@ -128,6 +129,19 @@ class OrderBook:
             )
             self.positions[key] = pos
         else:
+            # Compute realized P&L for the portion of the trade that closes an
+            # existing position (order qty and position qty have opposite signs).
+            if pos.quantity * qty < 0:
+                close_qty = min(abs(pos.quantity), abs(qty))
+                if pos.quantity > 0:
+                    # Closing a long position
+                    realized = (fill_price - pos.avg_price) * close_qty
+                else:
+                    # Closing a short position
+                    realized = (pos.avg_price - fill_price) * close_qty
+                order.pnl = realized
+                self.realized_pnl += realized
+
             old_val = pos.avg_price * pos.quantity
             new_val = fill_price * qty
             total_qty = pos.quantity + qty
@@ -166,9 +180,5 @@ class OrderBook:
             pos.pnl = pos.unrealised_pnl
 
     def total_pnl(self) -> float:
-        realized = sum(
-            o.pnl for o in self.orders.values()
-            if o.status == OrderStatus.COMPLETE
-        )
         unrealized = sum(p.unrealised_pnl for p in self.positions.values())
-        return realized + unrealized
+        return self.realized_pnl + unrealized

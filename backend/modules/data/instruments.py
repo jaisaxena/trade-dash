@@ -76,12 +76,29 @@ def refresh_instruments() -> int:
     return count
 
 
+def _trigram_score(text: str, query: str) -> int:
+    """Return count of query characters found in text (simple fuzzy score)."""
+    text_lower = text.lower()
+    score = 0
+    for ch in query.lower():
+        if ch in text_lower:
+            score += 1
+    return score
+
+
 def search_instruments(
     search: str = "",
     limit: int = 100,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
-    """Return a page of instruments from DuckDB plus total matching count."""
+    """Return a page of instruments from DuckDB plus total matching count.
+
+    Matching logic (in order of precision):
+      1. Exact prefix on tradingsymbol (highest priority)
+      2. Substring match on tradingsymbol or name or token string
+      3. Fuzzy / typo tolerance: any row where >=80% of query characters appear
+         in tradingsymbol or name — catches 'mifty' → NIFTY, 'banknipty' → BANKNIFTY
+    """
     conn = get_conn()
     limit = min(max(1, limit), 500)
     offset = max(0, offset)
@@ -91,41 +108,62 @@ def search_instruments(
         "instrument_token, tradingsymbol, name, exchange, segment, "
         "instrument_type, strike, expiry, lot_size"
     )
+    keys = [
+        "instrument_token", "tradingsymbol", "name", "exchange", "segment",
+        "instrument_type", "strike", "expiry", "lot_size",
+    ]
 
-    if search:
-        where = (
-            "(strpos(lower(tradingsymbol), lower(?)) > 0 "
-            "OR strpos(lower(COALESCE(name, '')), lower(?)) > 0 "
-            "OR strpos(CAST(instrument_token AS VARCHAR), ?) > 0)"
-        )
-        params: list = [search, search, search]
-    else:
-        where = "TRUE"
-        params = []
+    if not search:
+        total = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
+        rows = conn.execute(
+            f"SELECT {cols} FROM instruments ORDER BY tradingsymbol LIMIT ? OFFSET ?",
+            [limit, offset],
+        ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            row = dict(zip(keys, r, strict=True))
+            if row.get("expiry") is not None and hasattr(row["expiry"], "isoformat"):
+                row["expiry"] = row["expiry"].isoformat()
+            out.append(row)
+        return out, int(total)
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM instruments WHERE {where}",
-        params,
-    ).fetchone()[0]
+    # ── Phase 1: substring match (fast SQL) ─────────────────────────────
+    where = (
+        "(strpos(lower(tradingsymbol), lower(?)) > 0 "
+        "OR strpos(lower(COALESCE(name, '')), lower(?)) > 0 "
+        "OR strpos(CAST(instrument_token AS VARCHAR), ?) > 0)"
+    )
+    params: list = [search, search, search]
 
+    total = conn.execute(f"SELECT COUNT(*) FROM instruments WHERE {where}", params).fetchone()[0]
     rows = conn.execute(
-        f"SELECT {cols} FROM instruments WHERE {where} "
-        "ORDER BY tradingsymbol LIMIT ? OFFSET ?",
+        f"SELECT {cols} FROM instruments WHERE {where} ORDER BY tradingsymbol LIMIT ? OFFSET ?",
         [*params, limit, offset],
     ).fetchall()
 
-    keys = [
-        "instrument_token",
-        "tradingsymbol",
-        "name",
-        "exchange",
-        "segment",
-        "instrument_type",
-        "strike",
-        "expiry",
-        "lot_size",
-    ]
-    out: list[dict] = []
+    # ── Phase 2: fuzzy fallback when substring finds nothing ─────────────
+    if not rows:
+        threshold = max(1, int(len(search) * 0.75))  # need ≥75% char match
+        candidates = conn.execute(
+            f"SELECT {cols} FROM instruments "
+            "WHERE length(tradingsymbol) <= ? + ? ORDER BY tradingsymbol LIMIT 5000",
+            [len(search), max(6, len(search))],
+        ).fetchall()
+
+        scored: list[tuple[int, tuple]] = []
+        for r in candidates:
+            sym = r[1] or ""
+            name = r[2] or ""
+            score = max(_trigram_score(sym, search), _trigram_score(name, search))
+            if score >= threshold:
+                scored.append((score, r))
+
+        scored.sort(key=lambda x: -x[0])
+        total = len(scored)
+        page = scored[offset: offset + limit]
+        rows = [r for _, r in page]
+
+    out = []
     for r in rows:
         row = dict(zip(keys, r, strict=True))
         if row.get("expiry") is not None and hasattr(row["expiry"], "isoformat"):

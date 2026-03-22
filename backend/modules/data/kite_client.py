@@ -96,6 +96,23 @@ def is_authenticated() -> bool:
     return _access_token is not None
 
 
+def get_ltps(instruments: list[str]) -> dict[str, float]:
+    """Fetch LTP for a list of 'EXCHANGE:SYMBOL' strings. Returns {symbol: ltp}.
+    Returns an empty dict if not authenticated or on any error."""
+    if not is_authenticated() or not instruments:
+        return {}
+    try:
+        raw = get_kite().ltp(instruments)
+        return {
+            data["tradingsymbol"]: data["last_price"]
+            for data in raw.values()
+            if data.get("last_price") is not None
+        }
+    except Exception as e:
+        log.warning("get_ltps failed: %s", e)
+        return {}
+
+
 def get_ticker(on_ticks, on_connect) -> KiteTicker:
     """Return a KiteTicker wired to *on_ticks* / *on_connect* callbacks."""
     get_kite()

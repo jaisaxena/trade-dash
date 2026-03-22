@@ -9,6 +9,8 @@ from modules.optimizer.router import router as optimizer_router
 from modules.backtest.router import router as backtest_router
 from modules.vault.router import router as vault_router
 from modules.trading.router import router as trading_router
+from modules.feed.router import router as feed_router
+from modules.auto_trade.router import router as auto_trade_router
 
 app = FastAPI(title="Trade Dash API", version="0.1.0")
 
@@ -26,6 +28,8 @@ app.include_router(optimizer_router, prefix="/api/optimizer", tags=["optimizer"]
 app.include_router(backtest_router, prefix="/api/backtest", tags=["backtest"])
 app.include_router(vault_router, prefix="/api/vault", tags=["vault"])
 app.include_router(trading_router, prefix="/api/trading", tags=["trading"])
+app.include_router(feed_router, prefix="/api/feed", tags=["feed"])
+app.include_router(auto_trade_router, prefix="/api/auto-trade", tags=["auto-trade"])
 
 
 @app.on_event("startup")
