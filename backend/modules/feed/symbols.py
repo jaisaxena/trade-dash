@@ -58,8 +58,13 @@ _STRIKE_OFFSETS = {
 }
 
 
-def resolve_suggestions(strategy_id: str) -> list[dict]:
+def resolve_suggestions(strategy_id: str, direction: str | None = None) -> list[dict]:
     """Resolve concrete instrument suggestions for a strategy at the current feed moment.
+
+    Args:
+        strategy_id: vault strategy ID
+        direction: "long" or "short" — selects which leg structure to use.
+                   If None, defaults to "long".
 
     Returns a list of dicts with keys:
         tradingsymbol, exchange, action, lots, lot_size, option_type, strike, expiry
@@ -134,8 +139,11 @@ def resolve_suggestions(strategy_id: str) -> list[dict]:
     atm_strike = round(spot / strike_gap) * strike_gap
     df_instr   = get_option_instruments(underlying, expiry=target_expiry) if from_db else None
 
+    d = direction or "long"
+    structure = recipe.long_structure if d == "long" else recipe.short_structure
+
     suggestions: list[dict] = []
-    for leg in recipe.structure.legs:
+    for leg in structure.legs:
         offset     = _STRIKE_OFFSETS.get(leg.strike, 0)
         opt_type   = leg.option_type.upper()
         direction  = 1 if opt_type == "CE" else -1

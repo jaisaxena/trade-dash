@@ -22,6 +22,23 @@ type StatusData = Record<string, {
 
 type SyncMode = "range" | "full";
 
+type SyncStatus = {
+  active: boolean;
+  mode: string | null;
+  cancelled: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  underlyings: string[];
+  intervals: string[];
+  current_underlying: string | null;
+  current_interval: string | null;
+  steps_total: number;
+  steps_done: number;
+  rows_inserted: number;
+  log: { ts: string; msg: string }[];
+};
+
 type InstrumentRow = {
   instrument_token: number;
   tradingsymbol: string;
@@ -81,21 +98,36 @@ export default function DataPage() {
     refetchInterval: 10_000,
   });
 
-  const syncMutation = useMutation({
-    mutationFn: () => api.post("/api/data/sync", {
-      underlyings: selectedU,
-      intervals: selectedI,
-      from_date: fromDate,
-    }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["data-status"] }),
+  const syncStatus = useQuery<SyncStatus>({
+    queryKey: ["sync-status"],
+    queryFn: () => api.get<SyncStatus>("/api/data/sync/status"),
+    refetchInterval: (query) => query.state.data?.active ? 1500 : false,
   });
 
-  const fullSyncMutation = useMutation({
-    mutationFn: () => api.post("/api/data/sync/full", {
-      underlyings: selectedU,
-      intervals: selectedI,
-    }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["data-status"] }),
+  const isSyncActive = syncStatus.data?.active ?? false;
+
+  useEffect(() => {
+    if (syncStatus.data && !syncStatus.data.active && syncStatus.data.finished_at) {
+      qc.invalidateQueries({ queryKey: ["data-status"] });
+    }
+  }, [syncStatus.data?.active, syncStatus.data?.finished_at, qc]);
+
+  const startSyncMutation = useMutation({
+    mutationFn: () => {
+      const endpoint = syncMode === "full" ? "/api/data/sync/full" : "/api/data/sync";
+      const body = syncMode === "full"
+        ? { underlyings: selectedU, intervals: selectedI }
+        : { underlyings: selectedU, intervals: selectedI, from_date: fromDate };
+      return api.post(endpoint, body);
+    },
+    onSuccess: () => {
+      setTimeout(() => qc.invalidateQueries({ queryKey: ["sync-status"] }), 300);
+    },
+  });
+
+  const cancelSyncMutation = useMutation({
+    mutationFn: () => api.post("/api/data/sync/cancel"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["sync-status"] }),
   });
 
   const callbackMutation = useMutation({
@@ -128,8 +160,8 @@ export default function DataPage() {
     if (data.data?.login_url) window.open(data.data.login_url, "_blank");
   };
 
-  const activeMutation = syncMode === "full" ? fullSyncMutation : syncMutation;
-  const isSyncing = activeMutation.isPending;
+  const ss = syncStatus.data;
+  const isSyncing = isSyncActive || startSyncMutation.isPending;
 
   return (
     <div className="page">
@@ -290,31 +322,124 @@ export default function DataPage() {
             <button
               className={`btn ${syncMode === "full" ? "btn-warning" : "btn-primary"}`}
               style={{ width: "100%", justifyContent: "center" }}
-              onClick={() => activeMutation.mutate()}
+              onClick={() => startSyncMutation.mutate()}
               disabled={isSyncing || !auth.data?.authenticated || selectedU.length === 0 || selectedI.length === 0}
             >
-              {isSyncing
-                ? <><span className="spinner" /> {syncMode === "full" ? "Fetching full history…" : "Syncing…"}</>
+              {startSyncMutation.isPending
+                ? <><span className="spinner" /> Starting…</>
                 : syncMode === "full"
                   ? `Sync All History — ${selectedU.join(", ")}`
                   : `Sync ${selectedU.join(", ")} — ${selectedI.join(", ")}`}
             </button>
             {!auth.data?.authenticated && (
               <p style={{ margin: "8px 0 0", fontSize: 11, color: "var(--yellow-hi)" }}>
-                ⚠ Connect to Kite first
+                Connect to Kite first
               </p>
             )}
-            {activeMutation.isSuccess && (
-              <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--green-hi)" }}>
-                ✓ Sync complete
-              </p>
-            )}
-            {activeMutation.isError && (
+            {startSyncMutation.isError && (
               <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--red-hi)" }}>
-                ✗ {(activeMutation.error as Error)?.message}
+                {(startSyncMutation.error as Error)?.message}
               </p>
             )}
           </div>
+
+          {/* Sync progress panel */}
+          {ss && (ss.active || ss.finished_at) && (
+            <div className="card" style={{ padding: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                <div className="section-header" style={{ marginBottom: 0 }}>
+                  Sync {ss.mode === "full" ? "Full History" : "Range"}
+                </div>
+                {ss.active && (
+                  <button
+                    className="btn btn-danger btn-sm"
+                    style={{ fontSize: 11, padding: "4px 12px" }}
+                    onClick={() => cancelSyncMutation.mutate()}
+                    disabled={cancelSyncMutation.isPending || ss.cancelled}
+                  >
+                    {ss.cancelled ? "Stopping…" : "Cancel"}
+                  </button>
+                )}
+              </div>
+
+              {/* Progress bar */}
+              {ss.steps_total > 0 && (
+                <div style={{
+                  height: 6, borderRadius: 3,
+                  background: "var(--bg-elevated)",
+                  overflow: "hidden",
+                  marginBottom: 10,
+                }}>
+                  <div style={{
+                    height: "100%", borderRadius: 3,
+                    width: `${Math.round((ss.steps_done / ss.steps_total) * 100)}%`,
+                    background: ss.error
+                      ? "var(--red-hi)"
+                      : ss.cancelled
+                        ? "var(--yellow-hi)"
+                        : ss.active
+                          ? "var(--accent-hi)"
+                          : "var(--green-hi)",
+                    transition: "width .4s ease",
+                  }} />
+                </div>
+              )}
+
+              {/* Current step + counters */}
+              <div style={{ display: "flex", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                  Step <strong style={{ color: "var(--text)" }}>{ss.steps_done}</strong> / {ss.steps_total}
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                  Rows <strong style={{ color: "var(--green-hi)", fontFamily: "monospace" }}>{ss.rows_inserted.toLocaleString()}</strong>
+                </div>
+                {ss.active && ss.current_underlying && (
+                  <div style={{ fontSize: 11 }}>
+                    <span style={{ color: "var(--accent-hi)", fontWeight: 700 }}>
+                      {ss.current_underlying} {ss.current_interval}
+                    </span>
+                    {ss.active && !ss.cancelled && <span className="spinner" style={{ marginLeft: 6, width: 10, height: 10 }} />}
+                  </div>
+                )}
+              </div>
+
+              {/* Status badge */}
+              {!ss.active && ss.finished_at && (
+                <div style={{
+                  padding: "6px 10px", borderRadius: 6, marginBottom: 8, fontSize: 12, fontWeight: 600,
+                  background: ss.error
+                    ? "rgba(239,68,68,.12)"
+                    : ss.cancelled
+                      ? "rgba(234,179,8,.12)"
+                      : "rgba(16,185,129,.12)",
+                  color: ss.error ? "var(--red-hi)" : ss.cancelled ? "var(--yellow-hi)" : "var(--green-hi)",
+                  border: `1px solid ${ss.error ? "rgba(239,68,68,.25)" : ss.cancelled ? "rgba(234,179,8,.25)" : "rgba(16,185,129,.25)"}`,
+                }}>
+                  {ss.error ? `Failed: ${ss.error}` : ss.cancelled ? "Cancelled by user" : `Complete — ${ss.rows_inserted.toLocaleString()} rows synced`}
+                </div>
+              )}
+
+              {/* Log entries */}
+              {ss.log.length > 0 && (
+                <div style={{
+                  maxHeight: 140, overflowY: "auto",
+                  borderRadius: 6, border: "1px solid var(--border-dim)",
+                  background: "var(--bg-elevated)", padding: 8,
+                  fontSize: 11, fontFamily: "var(--font-mono, ui-monospace, monospace)",
+                  lineHeight: 1.7,
+                }}>
+                  {ss.log.map((entry, i) => (
+                    <div key={i} style={{ color: "var(--text-muted)" }}>
+                      <span style={{ color: "var(--text-dim)", marginRight: 6 }}>
+                        {entry.ts.split("T")[1]}
+                      </span>
+                      {entry.msg}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* F&O instruments cache */}
           <div className="card" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>

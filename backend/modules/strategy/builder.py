@@ -1,6 +1,6 @@
 """Strategy compiler — takes a StrategyRecipe and a candle DataFrame,
 computes all indicators, evaluates entry/exit conditions, and returns
-boolean signal arrays suitable for the backtest engine.
+direction signals (long / short / neutral) per bar.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from modules.strategy.models import (
     EntryCondition,
     ExitCondition,
     ExitType,
+    IndicatorVar,
     StrategyRecipe,
 )
 from modules.strategy.indicators import compute_indicator
@@ -30,6 +31,40 @@ def _get_indicator_series(
     if isinstance(result, pd.DataFrame):
         return result.iloc[:, 0]
     return result
+
+
+def _resolve_indicator(
+    name: str,
+    inline_params: dict[str, Any],
+    var_lookup: dict[str, IndicatorVar],
+    overrides: dict[str, Any],
+    alias: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Return (indicator_type, resolved_params) for an indicator reference.
+
+    Resolution priority:
+      1. Named variable — ``name`` matches a key in ``var_lookup``.
+         Override key prefix = variable name.
+      2. Legacy alias — ``name`` is a raw indicator type but ``alias`` is set.
+         Override key prefix = alias.
+      3. Raw indicator type — backward compat, key prefix = indicator name.
+    """
+    if name in var_lookup:
+        var = var_lookup[name]
+        indicator_type = var.indicator
+        params = dict(var.params)
+        prefix = name
+    else:
+        indicator_type = name
+        params = dict(inline_params)
+        prefix = alias or name
+
+    for key, val in overrides.items():
+        parts = key.split(".")
+        if len(parts) == 2 and parts[0] == prefix:
+            params[parts[1]] = val
+
+    return indicator_type, params
 
 
 def _evaluate_condition(
@@ -65,32 +100,53 @@ def _evaluate_condition(
     raise ValueError(f"Unknown operator: {op}")
 
 
-def compile_entry_signals(
-    recipe: StrategyRecipe,
+def _compile_condition_mask(
+    conditions: list[EntryCondition],
     df: pd.DataFrame,
-    param_overrides: dict[str, Any] | None = None,
+    overrides: dict[str, Any],
+    var_lookup: dict[str, IndicatorVar] | None = None,
 ) -> pd.Series:
-    """Evaluate all entry conditions with AND logic. Returns bool Series."""
-    overrides = param_overrides or {}
+    """AND-combine a list of indicator conditions into a boolean mask."""
+    var_lookup = var_lookup or {}
     mask = pd.Series(True, index=df.index)
+    if not conditions:
+        return pd.Series(False, index=df.index)
 
-    for cond in recipe.entry_conditions:
-        params = dict(cond.params)
-        for key, val in overrides.items():
-            parts = key.split(".")
-            if len(parts) == 2 and parts[0] == cond.indicator:
-                params[parts[1]] = val
+    for cond in conditions:
+        # --- Main indicator ---
+        ind_type, params = _resolve_indicator(
+            cond.indicator, cond.params, var_lookup, overrides,
+            alias=cond.indicator_alias,
+        )
+        series = _get_indicator_series(ind_type, params, df)
 
-        series = _get_indicator_series(cond.indicator, params, df)
-
+        # --- Compare indicator ---
         compare_series = None
         if cond.compare_indicator:
-            cp = dict(cond.compare_params or {})
-            for key, val in overrides.items():
-                parts = key.split(".")
-                if len(parts) == 2 and parts[0] == cond.compare_indicator:
-                    cp[parts[1]] = val
-            compare_series = _get_indicator_series(cond.compare_indicator, cp, df)
+            cmp_name = cond.compare_indicator
+            if cmp_name in var_lookup or cond.compare_alias:
+                # Named variable OR explicit alias — clean path
+                cmp_type, cp = _resolve_indicator(
+                    cmp_name, cond.compare_params or {}, var_lookup, overrides,
+                    alias=cond.compare_alias,
+                )
+            else:
+                # Full legacy: try compare_{indicator}.param, then bare {indicator}.param
+                cmp_type = cmp_name
+                cp = dict(cond.compare_params or {})
+                compare_prefix = f"compare_{cmp_name}"
+                compare_specific: set[str] = set()
+                for key, val in overrides.items():
+                    parts = key.split(".")
+                    if len(parts) == 2 and parts[0] == compare_prefix:
+                        cp[parts[1]] = val
+                        compare_specific.add(parts[1])
+                for key, val in overrides.items():
+                    parts = key.split(".")
+                    if (len(parts) == 2 and parts[0] == cmp_name
+                            and parts[1] not in compare_specific):
+                        cp[parts[1]] = val
+            compare_series = _get_indicator_series(cmp_type, cp, df)
 
         cond_mask = _evaluate_condition(series, cond.condition, cond.value, compare_series)
         mask = mask & cond_mask
@@ -98,13 +154,39 @@ def compile_entry_signals(
     return mask.fillna(False)
 
 
+def compile_direction_signal(
+    recipe: StrategyRecipe,
+    df: pd.DataFrame,
+    param_overrides: dict[str, Any] | None = None,
+) -> pd.Series:
+    """Evaluate all entry conditions grouped by direction.
+
+    Returns a categorical Series with values "long", "short", or "neutral"
+    for each bar.
+    """
+    overrides = param_overrides or {}
+    var_lookup = {v.name: v for v in (recipe.indicator_vars or [])}
+
+    long_conds  = [c for c in recipe.entry_conditions if c.direction == "long"]
+    short_conds = [c for c in recipe.entry_conditions if c.direction == "short"]
+
+    long_mask  = _compile_condition_mask(long_conds, df, overrides, var_lookup)
+    short_mask = _compile_condition_mask(short_conds, df, overrides, var_lookup)
+
+    signal = pd.Series("neutral", index=df.index)
+    signal[long_mask]  = "long"
+    signal[short_mask] = "short"
+    signal[long_mask & short_mask] = "neutral"
+
+    return signal
+
+
 def compile_exit_signals(
     recipe: StrategyRecipe,
     df: pd.DataFrame,
-    entry_signals: pd.Series,
     param_overrides: dict[str, Any] | None = None,
 ) -> pd.Series:
-    """Compile exit signals. Uses OR logic — any exit condition triggers."""
+    """Compile general exit signals (indicator / time). Uses OR logic."""
     overrides = param_overrides or {}
     exit_mask = pd.Series(False, index=df.index)
 
@@ -133,12 +215,56 @@ def compile_exit_signals(
     return exit_mask.fillna(False)
 
 
+def compile_exit_indicator_signals(
+    recipe: StrategyRecipe,
+    df: pd.DataFrame,
+    param_overrides: dict[str, Any] | None = None,
+) -> dict[str, pd.Series]:
+    """Compile indicator-based directional exit signals.
+
+    Returns:
+        long_exit  — True on bars where long positions should close.
+        short_exit — True on bars where short positions should close.
+
+    Conditions in exit_indicator_conditions with direction=="long" are
+    AND-combined to form long_exit; direction=="short" → short_exit.
+    An empty condition list for a direction means it never fires independently
+    (the direction change or rule-based exits still apply).
+    """
+    overrides = param_overrides or {}
+    var_lookup = {v.name: v for v in (recipe.indicator_vars or [])}
+    false = pd.Series(False, index=df.index)
+
+    long_conds  = [c for c in recipe.exit_indicator_conditions if c.direction == "long"]
+    short_conds = [c for c in recipe.exit_indicator_conditions if c.direction == "short"]
+
+    long_exit  = _compile_condition_mask(long_conds,  df, overrides, var_lookup) if long_conds  else false.copy()
+    short_exit = _compile_condition_mask(short_conds, df, overrides, var_lookup) if short_conds else false.copy()
+
+    return {"long_exit": long_exit, "short_exit": short_exit}
+
+
 def compile_signals(
     recipe: StrategyRecipe,
     df: pd.DataFrame,
     param_overrides: dict[str, Any] | None = None,
 ) -> dict[str, pd.Series]:
-    """One-shot compile: returns {'entries': bool Series, 'exits': bool Series}."""
-    entries = compile_entry_signals(recipe, df, param_overrides)
-    exits = compile_exit_signals(recipe, df, entries, param_overrides)
-    return {"entries": entries, "exits": exits}
+    """Returns {'entries', 'exits', 'direction', 'long_exit', 'short_exit'}.
+
+    'entries'    = True where direction is "long" (legacy callers).
+    'exits'      = rule-based exits (time, general indicator conditions).
+    'direction'  = full "long"/"short"/"neutral" series.
+    'long_exit'  = indicator-based signal to close a long position.
+    'short_exit' = indicator-based signal to close a short position.
+    """
+    direction = compile_direction_signal(recipe, df, param_overrides)
+    exits = compile_exit_signals(recipe, df, param_overrides)
+    ind_exits = compile_exit_indicator_signals(recipe, df, param_overrides)
+    entries = direction == "long"
+    return {
+        "entries":    entries,
+        "exits":      exits,
+        "direction":  direction,
+        "long_exit":  ind_exits["long_exit"],
+        "short_exit": ind_exits["short_exit"],
+    }

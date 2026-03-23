@@ -8,7 +8,7 @@ A recipe describes WHAT to trade (option legs), WHEN to enter/exit
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -68,13 +68,30 @@ class ConditionOperator(str, Enum):
     CROSSUNDER = "crossunder"
 
 
+class IndicatorVar(BaseModel):
+    """A named indicator instance defined once in the recipe.
+    Entry conditions reference these by name so the same variable can appear
+    on either side of any condition without ambiguity.
+    """
+    name: str                              # e.g. "fast_ema"
+    indicator: str                         # e.g. "EMA"
+    params: dict[str, Any] = Field(default_factory=dict)  # e.g. {"period": 20}
+
+
 class EntryCondition(BaseModel):
+    # `indicator` and `compare_indicator` may hold either a raw indicator type
+    # (e.g. "EMA") for legacy recipes, or a named variable from indicator_vars
+    # (e.g. "fast_ema") for recipes built with the variable system.
     indicator: str
     params: dict[str, Any] = Field(default_factory=dict)
     condition: ConditionOperator
     value: float | str | None = None
     compare_indicator: str | None = None
     compare_params: dict[str, Any] | None = None
+    direction: Literal["long", "short"] = "long"
+    # Legacy alias fields — kept for backward compat with pre-variable recipes.
+    indicator_alias: str | None = None
+    compare_alias: str | None = None
 
 
 class ExitType(str, Enum):
@@ -84,6 +101,7 @@ class ExitType(str, Enum):
     TIME_EXIT = "time_exit"
     INDICATOR = "indicator"
     MAX_HOLDING_BARS = "max_holding_bars"
+    DIRECTION_CHANGE = "direction_change"
 
 
 class ExitCondition(BaseModel):
@@ -101,8 +119,16 @@ class StrategyRecipe(BaseModel):
     version: int = 1
     underlying: str = "NIFTY"
     expiry_offset: ExpiryOffset = ExpiryOffset.WEEKLY_CURRENT
-    structure: OptionStructure
+    long_structure: OptionStructure
+    short_structure: OptionStructure
+    structure: OptionStructure | None = Field(default=None, exclude=True)
+    indicator_vars: list[IndicatorVar] = Field(default_factory=list)
     entry_conditions: list[EntryCondition]
+    # Indicator-based directional exit conditions.
+    # direction=="long" means "fire this to exit a long position".
+    # direction=="short" means "fire this to exit a short position".
+    # All conditions within a direction are AND-combined.
+    exit_indicator_conditions: list[EntryCondition] = Field(default_factory=list)
     exit_conditions: list[ExitCondition]
     param_ranges: dict[str, list[Any]] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -113,8 +139,11 @@ class StrategyRecipeUpdate(BaseModel):
     name: str | None = None
     underlying: str | None = None
     expiry_offset: ExpiryOffset | None = None
-    structure: OptionStructure | None = None
+    long_structure: OptionStructure | None = None
+    short_structure: OptionStructure | None = None
+    indicator_vars: list[IndicatorVar] | None = None
     entry_conditions: list[EntryCondition] | None = None
+    exit_indicator_conditions: list[EntryCondition] | None = None
     exit_conditions: list[ExitCondition] | None = None
     param_ranges: dict[str, list[Any]] | None = None
     metadata: dict[str, Any] | None = None

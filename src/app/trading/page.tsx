@@ -11,10 +11,10 @@ type Position = { tradingsymbol: string; quantity: number; avg_price: number; lt
 type Order    = { id: string; tradingsymbol: string; transaction_type: string; quantity: number; fill_price: number | null; price: number; status: string };
 type Candle        = { timestamp: string; open: number; high: number; low: number; close: number; volume: number; ltp: number };
 type FeedQuote     = { mode: string; replay_state: string | null; underlying: string; interval: string; quote: Candle | null; history: Candle[] };
-type MonitorResult  = { verdict: "BUY" | "SELL" | "HOLD"; entry: boolean; exit: boolean; timestamp: string | null; close: number; candles_used: number; reason: string | null };
+type MonitorResult  = { verdict: "LONG" | "SHORT" | "NEUTRAL"; direction: string; timestamp: string | null; close: number; candles_used: number; reason: string | null };
 type InstrumentRow  = { instrument_token: number; tradingsymbol: string; name: string | null; exchange: string; segment: string; instrument_type: string; strike: number | null; expiry: string | null; lot_size: number | null };
 type SuggestionRow  = { tradingsymbol: string; instrument_token: number; option_type: string; strike: number; expiry: string; lot_size: number | null; action: string; lots: number; strike_ref: string };
-type AutoTradeStatus = { enabled: boolean; status: "idle" | "in_position"; strategy_id: string | null; trading_mode: string; open_legs: string[]; last_action: string | null };
+type AutoTradeStatus = { enabled: boolean; status: "idle" | "in_long" | "in_short"; current_direction: string | null; strategy_id: string | null; trading_mode: string; open_legs: string[]; last_action: string | null };
 
 const STATUS_COLOR: Record<string, string> = {
   COMPLETE:  "badge-green",
@@ -115,12 +115,14 @@ export default function TradingPage() {
     refetchInterval: monitorIntervalMs,
   });
 
+  const monitorDirection = monitorQuery.data?.direction ?? "neutral";
+
   const suggestionsQuery = useQuery({
-    queryKey: ["feed-suggestions", monitorStrategyId],
+    queryKey: ["feed-suggestions", monitorStrategyId, monitorDirection],
     queryFn: () => api.get<{ suggestions: SuggestionRow[]; underlying: string; expiry: string; spot: number; atm_strike: number; reason?: string }>(
-      `/api/feed/suggestions?strategy_id=${monitorStrategyId}`
+      `/api/feed/suggestions?strategy_id=${monitorStrategyId}&direction=${monitorDirection}`
     ),
-    enabled: !!monitorStrategyId,
+    enabled: !!monitorStrategyId && monitorDirection !== "neutral",
     refetchInterval: monitorIntervalMs,
   });
 
@@ -330,20 +332,38 @@ export default function TradingPage() {
   }, []);
 
   // ── Mini chart: update data when feed changes ─────────────────────
+  const prevHistLenRef = useRef(0);
   useEffect(() => {
-    const candles = feedQuery.data?.history;
-    if (!candles?.length || !candleSerRef.current) return;
+    const history = feedQuery.data?.history;
+    if (!history?.length || !candleSerRef.current) return;
 
-    const sorted = [...candles].sort((a, b) => toUnix(a.timestamp) - toUnix(b.timestamp));
+    const sorted = [...history].sort((a, b) => toUnix(a.timestamp) - toUnix(b.timestamp));
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    candleSerRef.current.setData(sorted.map((c): any => ({
-      time:  toUnix(c.timestamp) as unknown as string,
+    const chartData: any[] = sorted.map((c) => ({
+      time:  toUnix(c.timestamp),
       open:  c.open,
       high:  c.high,
       low:   c.low,
       close: c.close,
-    })));
-    chartRef.current?.timeScale().fitContent();
+    }));
+
+    // In live mode, update the last candle (the current forming candle
+    // from Kite) with the real-time LTP so it moves between cache refreshes.
+    const quote = feedQuery.data?.quote;
+    if (feedQuery.data?.mode === "live" && quote && quote.ltp > 0 && chartData.length > 0) {
+      const last = chartData[chartData.length - 1];
+      last.close = quote.ltp;
+      last.high  = Math.max(last.high, quote.ltp);
+      last.low   = Math.min(last.low, quote.ltp);
+    }
+
+    candleSerRef.current.setData(chartData);
+
+    if (sorted.length !== prevHistLenRef.current) {
+      chartRef.current?.timeScale().fitContent();
+      prevHistLenRef.current = sorted.length;
+    }
   }, [feedQuery.data]);
 
   // ── Derived feed values ───────────────────────────────────────────
@@ -353,7 +373,7 @@ export default function TradingPage() {
   const isPlaying   = replayState === "playing";
   const totalPnl    = pnl.data?.total_pnl ?? 0;
   const monitor     = monitorQuery.data;
-  const verdict     = monitor?.verdict ?? "HOLD";
+  const verdict     = monitor?.verdict ?? "NEUTRAL";
 
   return (
     <div className="page">
@@ -491,10 +511,10 @@ export default function TradingPage() {
                   </span>
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4, color: "var(--text-muted)" }}>
-                  <span>O <span style={{ color: "var(--text)" }}>{feed.quote.open.toFixed(0)}</span></span>
-                  <span>H <span style={{ color: "var(--green-hi)" }}>{feed.quote.high.toFixed(0)}</span></span>
-                  <span>L <span style={{ color: "var(--red-hi)" }}>{feed.quote.low.toFixed(0)}</span></span>
-                  <span>C <span style={{ color: "var(--text)" }}>{feed.quote.close.toFixed(0)}</span></span>
+                  <span>O <span style={{ color: "var(--text)" }}>{feed.quote.open.toFixed(2)}</span></span>
+                  <span>H <span style={{ color: "var(--green-hi)" }}>{feed.quote.high.toFixed(2)}</span></span>
+                  <span>L <span style={{ color: "var(--red-hi)" }}>{feed.quote.low.toFixed(2)}</span></span>
+                  <span>C <span style={{ color: "var(--text)" }}>{feed.quote.close.toFixed(2)}</span></span>
                 </div>
                 {feedMode === "replay" && (
                   <div style={{ marginTop: 4, fontSize: 11, color: "var(--text-dim)" }}>
@@ -593,12 +613,12 @@ export default function TradingPage() {
                 fontWeight: 800,
                 fontSize: 15,
                 letterSpacing: 1,
-                background: verdict === "BUY"  ? "rgba(5,150,105,.2)"  :
-                            verdict === "SELL" ? "rgba(220,38,38,.2)"   : "rgba(100,116,139,.15)",
-                border: `2px solid ${verdict === "BUY"  ? "var(--green)"  :
-                                     verdict === "SELL" ? "var(--red)"    : "var(--border)"}`,
-                color: verdict === "BUY"  ? "var(--green-hi)"  :
-                       verdict === "SELL" ? "var(--red-hi)"    : "var(--text-muted)",
+                background: verdict === "LONG"  ? "rgba(5,150,105,.2)"  :
+                            verdict === "SHORT" ? "rgba(220,38,38,.2)"   : "rgba(100,116,139,.15)",
+                border: `2px solid ${verdict === "LONG"  ? "var(--green)"  :
+                                     verdict === "SHORT" ? "var(--red)"    : "var(--border)"}`,
+                color: verdict === "LONG"  ? "var(--green-hi)"  :
+                       verdict === "SHORT" ? "var(--red-hi)"    : "var(--text-muted)",
                 minWidth: 80,
                 textAlign: "center",
               }}>
@@ -626,23 +646,13 @@ export default function TradingPage() {
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{
                     padding: "2px 10px", borderRadius: 4, fontWeight: 800, fontSize: 12,
-                    background: verdict === "BUY"  ? "rgba(5,150,105,.2)"  :
-                                verdict === "SELL" ? "rgba(220,38,38,.2)"   : "rgba(100,116,139,.15)",
-                    border: `1px solid ${verdict === "BUY"  ? "var(--green)"  :
-                                         verdict === "SELL" ? "var(--red)"    : "var(--border)"}`,
-                    color: verdict === "BUY"  ? "var(--green-hi)"  :
-                           verdict === "SELL" ? "var(--red-hi)"    : "var(--text-muted)",
+                    background: verdict === "LONG"  ? "rgba(5,150,105,.2)"  :
+                                verdict === "SHORT" ? "rgba(220,38,38,.2)"   : "rgba(100,116,139,.15)",
+                    border: `1px solid ${verdict === "LONG"  ? "var(--green)"  :
+                                         verdict === "SHORT" ? "var(--red)"    : "var(--border)"}`,
+                    color: verdict === "LONG"  ? "var(--green-hi)"  :
+                           verdict === "SHORT" ? "var(--red-hi)"    : "var(--text-muted)",
                   }}>{verdict}</span>
-                  {verdict !== "HOLD" && !autoTradeOn && (
-                    <button
-                      onClick={() => setSide(verdict as "BUY" | "SELL")}
-                      style={{
-                        padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: "pointer",
-                        border: "1px solid var(--accent)", background: "rgba(37,99,235,.15)",
-                        color: "var(--accent-hi)",
-                      }}
-                    >Apply</button>
-                  )}
                 </div>
               )}
             </div>
@@ -653,19 +663,30 @@ export default function TradingPage() {
                 display: "flex", alignItems: "center", justifyContent: "space-between",
                 marginBottom: 12, padding: "7px 10px", borderRadius: 6,
                 background: autoTradeOn
-                  ? (autoTradeStatus?.status === "in_position" ? "rgba(5,150,105,.12)" : "rgba(37,99,235,.1)")
+                  ? (autoTradeStatus?.status === "in_long" ? "rgba(5,150,105,.12)"
+                    : autoTradeStatus?.status === "in_short" ? "rgba(220,38,38,.12)"
+                    : "rgba(37,99,235,.1)")
                   : "var(--bg-elevated)",
-                border: `1px solid ${autoTradeOn ? (autoTradeStatus?.status === "in_position" ? "var(--green)" : "var(--accent)") : "var(--border)"}`,
+                border: `1px solid ${autoTradeOn
+                  ? (autoTradeStatus?.status === "in_long" ? "var(--green)"
+                    : autoTradeStatus?.status === "in_short" ? "var(--red)"
+                    : "var(--accent)")
+                  : "var(--border)"}`,
               }}>
                 <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                   <span style={{ fontSize: 11, fontWeight: 700, color: autoTradeOn ? "var(--accent-hi)" : "var(--text-muted)" }}>
                     AUTO TRADE {autoTradeOn ? "ON" : "OFF"}
                   </span>
                   {autoTradeOn && autoTradeStatus && (
-                    <span style={{ fontSize: 10, color: autoTradeStatus.status === "in_position" ? "var(--green-hi)" : "var(--text-dim)" }}>
-                      {autoTradeStatus.status === "in_position"
-                        ? `IN POSITION · ${autoTradeStatus.open_legs.join(", ")}`
-                        : "watching for entry signal…"}
+                    <span style={{ fontSize: 10, color:
+                      autoTradeStatus.status === "in_long" ? "var(--green-hi)"
+                      : autoTradeStatus.status === "in_short" ? "var(--red-hi)"
+                      : "var(--text-dim)" }}>
+                      {autoTradeStatus.status === "in_long"
+                        ? `LONG · ${autoTradeStatus.open_legs.join(", ")}`
+                        : autoTradeStatus.status === "in_short"
+                          ? `SHORT · ${autoTradeStatus.open_legs.join(", ")}`
+                          : "watching for directional signal…"}
                     </span>
                   )}
                   {autoTradeOn && autoTradeStatus?.last_action && (
@@ -771,7 +792,7 @@ export default function TradingPage() {
             </div>
 
             {/* Strategy suggestions — only shown when the monitor has an actionable verdict */}
-            {verdict !== "HOLD" && suggestionsQuery.data?.suggestions && suggestionsQuery.data.suggestions.length > 0 && (
+            {verdict !== "NEUTRAL" && suggestionsQuery.data?.suggestions && suggestionsQuery.data.suggestions.length > 0 && (
               <div style={{ marginBottom: 12 }}>
                 <span style={{ fontSize: 10, color: "var(--text-dim)", display: "block", marginBottom: 4 }}>
                   Suggested · {suggestionsQuery.data.underlying} · expiry {suggestionsQuery.data.expiry}

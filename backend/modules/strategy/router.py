@@ -69,8 +69,8 @@ async def validate_recipe(recipe: StrategyRecipe):
     for cond in recipe.entry_conditions:
         if cond.indicator.upper() not in INDICATOR_REGISTRY:
             errors.append(f"Unknown indicator: {cond.indicator}")
-    if not recipe.structure.legs:
-        errors.append("Strategy must have at least one leg")
+    if not recipe.long_structure.legs and not recipe.short_structure.legs:
+        errors.append("Strategy must have at least one leg in either long or short structure")
     if not recipe.entry_conditions:
         errors.append("Strategy must have at least one entry condition")
     if not recipe.exit_conditions:

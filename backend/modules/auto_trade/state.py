@@ -1,13 +1,14 @@
 """Auto-trade singleton state.
 
-The state machine has two statuses:
-  idle        — no auto-managed position open; watching for entry signal.
-  in_position — one or more legs are open; watching for explicit exit signal.
+The state machine has three statuses:
+  idle     — no auto-managed position open; watching for directional signal.
+  in_long  — long legs are open; watching for exit / reversal to short.
+  in_short — short legs are open; watching for exit / reversal to long.
 
 Disabling auto-trade (enabled=False) pauses the engine without touching
 open positions.  Re-enabling resumes from wherever we left off: if the
-tracked legs are still open in the order book, status is restored to
-in_position; if they were closed externally, we reset to idle.
+tracked legs are still open in the order book, status is restored;
+if they were closed externally, we reset to idle.
 """
 
 from __future__ import annotations
@@ -29,19 +30,19 @@ class LegRecord:
 @dataclass
 class AutoTradeState:
     enabled: bool = False
-    status: Literal["idle", "in_position"] = "idle"
+    status: Literal["idle", "in_long", "in_short"] = "idle"
+    current_direction: Literal["long", "short"] | None = None
 
     strategy_id: str | None = None
     trading_mode: Literal["paper", "live"] = "paper"
 
-    # Unique ID for the current entry session (cleared on exit / idle reset)
     session_id: str | None = None
 
     # Legs currently managed by auto-trade: {tradingsymbol: LegRecord}
     open_legs: dict[str, LegRecord] = field(default_factory=dict)
 
     entry_time: datetime | None = None
-    last_action: str | None = None   # "entered" | "exited" | "expiry_exit" | "resumed"
+    last_action: str | None = None   # "entered_long" | "entered_short" | "reversed" | "exited" | "expiry_exit" | "resumed"
     last_tick: datetime | None = None
 
 

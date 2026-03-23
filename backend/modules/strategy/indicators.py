@@ -120,6 +120,30 @@ def pcr(oi_put: pd.Series, oi_call: pd.Series) -> pd.Series:
     return oi_put / oi_call.replace(0, np.nan)
 
 
+# ── Raw OHLCV passthrough ─────────────────────────────────────────────
+# These let users reference price/volume directly in condition logic
+# without needing a separate indicator variable.
+
+def close(df: pd.DataFrame) -> pd.Series:
+    return df["close"]
+
+
+def open_(df: pd.DataFrame) -> pd.Series:
+    return df["open"]
+
+
+def high(df: pd.DataFrame) -> pd.Series:
+    return df["high"]
+
+
+def low(df: pd.DataFrame) -> pd.Series:
+    return df["low"]
+
+
+def volume(df: pd.DataFrame) -> pd.Series:
+    return df["volume"]
+
+
 def stochastic(
     df: pd.DataFrame,
     k_period: int = 14,
@@ -174,6 +198,12 @@ INDICATOR_REGISTRY: dict[str, callable] = {
     "ADX": adx,
     "CCI": cci,
     "WILLIAMS_R": williams_r,
+    # Raw OHLCV — no params required
+    "CLOSE":  close,
+    "OPEN":   open_,
+    "HIGH":   high,
+    "LOW":    low,
+    "VOLUME": volume,
 }
 
 

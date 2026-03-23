@@ -1,14 +1,15 @@
 """Auto-trade engine — the core tick function and helpers.
 
-Rules (as specified):
-  - Entry fires on the FIRST tick where entries[-1] is True while status=idle.
-  - Exit fires ONLY when exits[-1] is True (explicit exit condition).
-    HOLD does NOT trigger exit.
+Rules:
+  - Entry fires on the FIRST tick where direction is "long" or "short"
+    while status=idle.  Enters the corresponding leg structure.
+  - Reversal: if status=in_long and signal=short (or vice versa), exit
+    current legs and enter opposite legs in the same tick.
+  - Neutral signal: hold current position (no entry, no exit).
+  - General exits (indicator/time) close the position and return to idle.
   - Stopping auto-trade (enabled=False) releases the watch immediately
     without closing any positions.
   - Re-enabling: reconciles open_legs with the live order book.
-    If tracked legs are still open → resume in_position.
-    If they were closed externally → reset to idle.
   - Expiry auto-exit: any tracked option whose expiry <= ref_date is closed
     before the signal check.
   - Only positions opened by auto-trade (tracked in open_legs) are ever
@@ -58,34 +59,43 @@ def _get_feed_df():
 # ── Signal evaluation ────────────────────────────────────────────────────────
 
 def _run_signals(strategy_id: str) -> dict:
-    """Compile entry/exit signals for the strategy on current feed data."""
+    """Compile all signals for the strategy on current feed data."""
     from modules.vault.store import load_recipe
-    from modules.strategy.builder import compile_signals
+    from modules.strategy.builder import (
+        compile_direction_signal,
+        compile_exit_signals,
+        compile_exit_indicator_signals,
+    )
 
     df, ref_date = _get_feed_df()
     if df is None or len(df) < 5:
-        return {"entry": False, "exit": False, "ref_date": ref_date,
-                "reason": "Insufficient feed data"}
+        return {"direction": "neutral", "general_exit": False,
+                "long_exit": False, "short_exit": False,
+                "ref_date": ref_date, "reason": "Insufficient feed data"}
 
     recipe = load_recipe(strategy_id)
     if recipe is None:
-        return {"entry": False, "exit": False, "ref_date": ref_date,
-                "reason": f"Strategy '{strategy_id}' not found"}
+        return {"direction": "neutral", "general_exit": False,
+                "long_exit": False, "short_exit": False,
+                "ref_date": ref_date, "reason": f"Strategy '{strategy_id}' not found"}
 
     try:
-        sigs  = compile_signals(recipe, df)
-        entry = bool(sigs["entries"].iloc[-1])
-        exit_ = bool(sigs["exits"].iloc[-1])
+        dir_signal   = compile_direction_signal(recipe, df)
+        exit_signal  = compile_exit_signals(recipe, df)
+        ind_exits    = compile_exit_indicator_signals(recipe, df)
         return {
-            "entry":               entry,
-            "exit":                exit_,
-            "has_exit_conditions": len(recipe.exit_conditions) > 0,
-            "ref_date":            ref_date,
-            "reason":              None,
+            "direction":   str(dir_signal.iloc[-1]),
+            "general_exit": bool(exit_signal.iloc[-1]),
+            "long_exit":   bool(ind_exits["long_exit"].iloc[-1]),
+            "short_exit":  bool(ind_exits["short_exit"].iloc[-1]),
+            "ref_date":    ref_date,
+            "reason":      None,
         }
     except Exception as exc:
         log.warning("Signal compilation failed: %s", exc)
-        return {"entry": False, "exit": False, "ref_date": ref_date, "reason": str(exc)}
+        return {"direction": "neutral", "general_exit": False,
+                "long_exit": False, "short_exit": False,
+                "ref_date": ref_date, "reason": str(exc)}
 
 
 # ── Order helpers ────────────────────────────────────────────────────────────
@@ -116,6 +126,51 @@ def _close_leg(sym: str, leg, mode: str) -> bool:
     return ok
 
 
+def _close_all_legs(state, trading_mode: str) -> list[str]:
+    """Close all open legs and clear them from state. Returns closed symbols."""
+    closed: list[str] = []
+    for sym, leg in list(state.open_legs.items()):
+        if _close_leg(sym, leg, trading_mode):
+            closed.append(sym)
+        state.open_legs.pop(sym, None)
+    return closed
+
+
+def _enter_direction(state, strategy_id: str, direction: str, trading_mode: str) -> list[str]:
+    """Open legs for the given direction. Returns entered symbols."""
+    from modules.auto_trade.state import LegRecord
+    from modules.feed.symbols import resolve_suggestions
+
+    suggestions = resolve_suggestions(strategy_id, direction=direction)
+    if not suggestions:
+        log.warning("Auto-trade: %s signal but no suggestions resolved for %s", direction, strategy_id)
+        return []
+
+    session_id = uuid4().hex[:8]
+    state.session_id = session_id
+    state.entry_time = datetime.now()
+    state.current_direction = direction
+    entered: list[str] = []
+
+    for s in suggestions:
+        sym = s["tradingsymbol"]
+        qty = s["lot_size"] * s["lots"]
+        if _place(sym, s["exchange"], s["action"], qty, strategy_id, trading_mode):
+            state.open_legs[sym] = LegRecord(
+                tradingsymbol=sym,
+                exchange=s["exchange"],
+                quantity=qty,
+                action=s["action"],
+            )
+            entered.append(sym)
+
+    if entered:
+        state.status = "in_long" if direction == "long" else "in_short"
+        log.info("Auto-trade entered %s position: %s", direction, entered)
+
+    return entered
+
+
 # ── Reconcile (resume after re-enable) ───────────────────────────────────────
 
 def _reconcile(state) -> None:
@@ -131,20 +186,23 @@ def _reconcile(state) -> None:
 
     still_open = {sym for sym in state.open_legs if sym in book.positions}
 
-    # Prune legs that no longer appear in the order book
     for sym in list(state.open_legs.keys()):
         if sym not in still_open:
             state.open_legs.pop(sym)
 
     if still_open:
-        state.status      = "in_position"
+        if state.current_direction:
+            state.status = "in_long" if state.current_direction == "long" else "in_short"
+        else:
+            state.status = "in_long"
         state.last_action = "resumed"
         log.info("Auto-trade resumed: %d legs still open: %s",
                  len(still_open), list(still_open))
     else:
         state.open_legs.clear()
-        state.status      = "idle"
-        state.session_id  = None
+        state.status = "idle"
+        state.current_direction = None
+        state.session_id = None
         state.last_action = None
         log.info("Auto-trade: all tracked legs were closed externally, resetting to idle")
 
@@ -152,13 +210,9 @@ def _reconcile(state) -> None:
 # ── Public tick API ──────────────────────────────────────────────────────────
 
 def tick(strategy_id: str, trading_mode: str) -> dict:
-    """Run one evaluation cycle.  Called on each strategy-monitor poll.
-
-    Returns a dict describing what (if anything) happened this tick.
-    """
-    from modules.auto_trade.state import get_state, LegRecord
+    """Run one evaluation cycle.  Called on each strategy-monitor poll."""
+    from modules.auto_trade.state import get_state
     from modules.trading.paper_trader import _parse_option_symbol
-    from modules.feed.symbols import resolve_suggestions
 
     state = get_state()
 
@@ -170,7 +224,7 @@ def tick(strategy_id: str, trading_mode: str) -> dict:
     state.last_tick    = datetime.now()
 
     # ── 1. Reconcile on first tick after re-enable ────────────────────────────
-    if state.open_legs and state.status != "in_position":
+    if state.open_legs and state.status == "idle":
         _reconcile(state)
 
     # ── 2. Expiry auto-exit ───────────────────────────────────────────────────
@@ -184,68 +238,85 @@ def tick(strategy_id: str, trading_mode: str) -> dict:
         if parsed and parsed["expiry"] <= ref_date:
             if _close_leg(sym, leg, trading_mode):
                 expired.append(sym)
-            state.open_legs.pop(sym, None)   # remove regardless of close success
+            state.open_legs.pop(sym, None)
 
     if expired:
         log.info("Auto-trade expiry exit: %s", expired)
         if not state.open_legs:
-            state.status      = "idle"
-            state.session_id  = None
+            state.status = "idle"
+            state.current_direction = None
+            state.session_id = None
             state.last_action = "expiry_exit"
 
     # ── 3. Evaluate strategy signals ─────────────────────────────────────────
-    sig         = _run_signals(strategy_id)
+    sig = _run_signals(strategy_id)
+    direction    = sig["direction"]
+    general_exit = sig["general_exit"]
+    long_exit    = sig["long_exit"]
+    short_exit   = sig["short_exit"]
     action_taken: str | None = None
 
     # ── 4. State machine ──────────────────────────────────────────────────────
-    if state.status == "idle" and sig["entry"]:
-        suggestions = resolve_suggestions(strategy_id)
-        if not suggestions:
-            log.warning("Auto-trade: entry signal but no suggestions resolved for %s", strategy_id)
-        else:
-            session_id = uuid4().hex[:8]
-            state.session_id = session_id
-            state.entry_time = datetime.now()
-            entered: list[str] = []
-
-            for s in suggestions:
-                sym = s["tradingsymbol"]
-                qty = s["lot_size"] * s["lots"]
-                if _place(sym, s["exchange"], s["action"], qty, strategy_id, trading_mode):
-                    state.open_legs[sym] = LegRecord(
-                        tradingsymbol=sym,
-                        exchange=s["exchange"],
-                        quantity=qty,
-                        action=s["action"],
-                    )
-                    entered.append(sym)
-
+    if state.status == "idle":
+        if direction in ("long", "short"):
+            entered = _enter_direction(state, strategy_id, direction, trading_mode)
             if entered:
-                state.status      = "in_position"
-                state.last_action = "entered"
-                action_taken      = "entered"
-                log.info("Auto-trade entered position: %s", entered)
+                state.last_action = f"entered_{direction}"
+                action_taken = f"entered_{direction}"
 
-    elif state.status == "in_position" and sig["exit"]:
-        exited: list[str] = []
-        for sym, leg in list(state.open_legs.items()):
-            if _close_leg(sym, leg, trading_mode):
-                exited.append(sym)
-            state.open_legs.pop(sym, None)
+    elif state.status in ("in_long", "in_short"):
+        cur = state.current_direction  # "long" or "short"
 
-        if exited:
-            state.status      = "idle"
-            state.session_id  = None
-            state.last_action = "exited"
-            action_taken      = "exited"
-            log.info("Auto-trade exited position: %s", exited)
+        # Indicator-based directional exit (fires before reversal check)
+        ind_exit = (cur == "long" and long_exit) or (cur == "short" and short_exit)
+
+        if ind_exit:
+            _close_all_legs(state, trading_mode)
+            state.status = "idle"
+            state.current_direction = None
+            state.session_id = None
+            state.last_action = "indicator_exit"
+            action_taken = "indicator_exit"
+            # If there is also a new entry signal for the other direction, enter it
+            if direction in ("long", "short") and direction != cur:
+                entered = _enter_direction(state, strategy_id, direction, trading_mode)
+                if entered:
+                    state.last_action = f"reversed_to_{direction}"
+                    action_taken = f"reversed_to_{direction}"
+
+        # Reversal: opposite directional entry signal
+        elif direction in ("long", "short") and direction != cur:
+            _close_all_legs(state, trading_mode)
+            entered = _enter_direction(state, strategy_id, direction, trading_mode)
+            if entered:
+                state.last_action = "reversed"
+                action_taken = f"reversed_to_{direction}"
+            else:
+                state.status = "idle"
+                state.current_direction = None
+                state.session_id = None
+                state.last_action = "exited"
+                action_taken = "exited"
+
+        # General rule-based exit (indicator conditions / time exit)
+        elif general_exit:
+            closed = _close_all_legs(state, trading_mode)
+            if closed:
+                state.status = "idle"
+                state.current_direction = None
+                state.session_id = None
+                state.last_action = "exited"
+                action_taken = "exited"
 
     return {
-        "status":        state.status,
-        "action_taken":  action_taken,
-        "entry_signal":  sig.get("entry", False),
-        "exit_signal":   sig.get("exit", False),
-        "open_legs":     list(state.open_legs.keys()),
-        "expired_legs":  expired,
-        "reason":        sig.get("reason"),
+        "status":             state.status,
+        "current_direction":  state.current_direction,
+        "action_taken":       action_taken,
+        "direction_signal":   direction,
+        "general_exit":       general_exit,
+        "long_exit":          long_exit,
+        "short_exit":         short_exit,
+        "open_legs":          list(state.open_legs.keys()),
+        "expired_legs":       expired,
+        "reason":             sig.get("reason"),
     }

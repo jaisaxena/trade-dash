@@ -14,7 +14,12 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 
 from db import get_conn
-from modules.data.kite_client import get_kite
+from modules.data.kite_client import get_kite, is_auth_error, invalidate_session, KiteAuthError
+from modules.data.sync_state import sync_tracker
+
+
+class SyncCancelledError(Exception):
+    pass
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +91,9 @@ def download_candles(
     cursor = from_date
 
     while cursor <= to_date:
+        if sync_tracker.is_cancelled():
+            raise SyncCancelledError("Sync cancelled by user")
+
         chunk_end = min(cursor + timedelta(days=max_days - 1), to_date)
 
         try:
@@ -97,6 +105,9 @@ def download_candles(
                 oi=True,
             )
         except Exception as e:
+            if is_auth_error(e):
+                invalidate_session()
+                raise KiteAuthError(f"Kite auth failed for token {instrument_token}: {e}") from e
             log.error("Kite API error for token %d: %s", instrument_token, e)
             time.sleep(1)
             cursor = chunk_end + timedelta(days=1)
@@ -123,10 +134,6 @@ def download_candles(
             )
             conn.execute("INSERT INTO candles SELECT * FROM df")
             total_inserted += len(df)
-            log.info(
-                "Token %d: inserted %d candles (%s to %s)",
-                instrument_token, len(df), cursor, chunk_end,
-            )
 
         time.sleep(RATE_LIMIT_DELAY)
         cursor = chunk_end + timedelta(days=1)
@@ -171,6 +178,9 @@ def download_full_history(
     SAFETY_FLOOR = date(1994, 1, 1)  # NSE inception
 
     while backward_end > SAFETY_FLOOR and consecutive_empty < 2:
+        if sync_tracker.is_cancelled():
+            raise SyncCancelledError("Sync cancelled by user")
+
         chunk_start = max(backward_end - timedelta(days=max_days - 1), SAFETY_FLOOR)
 
         try:
@@ -178,6 +188,9 @@ def download_full_history(
                 instrument_token, chunk_start, backward_end, kite_interval, oi=True
             )
         except Exception as e:
+            if is_auth_error(e):
+                invalidate_session()
+                raise KiteAuthError(f"Kite auth failed for token {instrument_token}: {e}") from e
             log.error("Kite API error going backward (token=%d %s → %s): %s", instrument_token, chunk_start, backward_end, e)
             consecutive_empty += 1
             backward_end = chunk_start - timedelta(days=1)

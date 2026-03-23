@@ -10,10 +10,10 @@ from pydantic import BaseModel
 
 from modules.feed.feed_state import get_state
 from modules.feed.replay_feed import load_candles, get_current_candle, get_recent_candles, _row_to_dict, _candle_idx
-from modules.feed.live_feed import get_live_quote
+from modules.feed.live_feed import get_live_quote, get_live_candles, SPOT_TOKENS as LIVE_SPOT_TOKENS
 from modules.data.downloader import get_candles
 from modules.data.sync import get_token, SPOT_TOKENS
-from modules.strategy.builder import compile_signals
+from modules.strategy.builder import compile_direction_signal
 from modules.vault.store import load_recipe
 from modules.data.instruments import get_expiries, get_option_instruments
 
@@ -180,7 +180,7 @@ def _expected_weekly_expiry(ref_date, expiries_set: set) -> tuple:
 
 
 @router.get("/suggestions")
-async def instrument_suggestions(strategy_id: str):
+async def instrument_suggestions(strategy_id: str, direction: str | None = None):
     """Return ranked instrument suggestions based on a strategy recipe's structure.
 
     For replay mode the suggestions are resolved relative to the *virtual* replay
@@ -288,8 +288,11 @@ async def instrument_suggestions(strategy_id: str):
     # ── Try DB instruments first; generate programmatically as fallback ───────
     df_instr = get_option_instruments(underlying, expiry=target_expiry) if from_db else None
 
+    d = direction or "long"
+    structure = recipe.long_structure if d == "long" else recipe.short_structure
+
     suggestions = []
-    for leg in recipe.structure.legs:
+    for leg in structure.legs:
         offset     = STRIKE_OFFSETS.get(leg.strike, 0)
         opt_type   = leg.option_type.upper()
         direction  = 1 if opt_type == "CE" else -1
@@ -347,12 +350,13 @@ async def analyze(strategy_id: str):
     """Run a vault strategy recipe against the current feed candles and return a verdict."""
     state = get_state()
 
+    _neutral = {"verdict": "NEUTRAL", "direction": "neutral",
+                "timestamp": None, "close": 0.0, "candles_used": 0}
+
     # Build analysis DataFrame from current feed state
     if state.mode == "replay":
         if state.candles_df is None or state.replay_state == "idle":
-            return {"verdict": "HOLD", "entry": False, "exit": False,
-                    "timestamp": None, "close": 0.0, "candles_used": 0,
-                    "reason": "Replay not configured or not started"}
+            return {**_neutral, "reason": "Replay not configured or not started"}
 
         df = state.candles_df
         if state.wall_start_time is None and state.paused_elapsed == 0.0:
@@ -363,26 +367,18 @@ async def analyze(strategy_id: str):
         analysis_df = df.iloc[max(0, idx - 499) : idx + 1].copy().reset_index(drop=True)
 
     else:  # live
-        if state.underlying not in SPOT_TOKENS:
-            return {"verdict": "HOLD", "entry": False, "exit": False,
-                    "timestamp": None, "close": 0.0, "candles_used": 0,
-                    "reason": f"Unknown underlying: {state.underlying}"}
+        if state.underlying not in LIVE_SPOT_TOKENS:
+            return {**_neutral, "reason": f"Unknown underlying: {state.underlying}"}
         try:
-            token = get_token(state.underlying)
-            analysis_df = get_candles(token, state.interval)
+            analysis_df = get_live_candles(state.underlying, state.interval, 500)
             if analysis_df.empty:
-                return {"verdict": "HOLD", "entry": False, "exit": False,
-                        "timestamp": None, "close": 0.0, "candles_used": 0,
-                        "reason": "No candle data found. Sync data first."}
+                return {**_neutral, "reason": "No live candle data. Ensure Kite is authenticated."}
             analysis_df = analysis_df.tail(500).reset_index(drop=True)
         except Exception as e:
-            return {"verdict": "HOLD", "entry": False, "exit": False,
-                    "timestamp": None, "close": 0.0, "candles_used": 0,
-                    "reason": str(e)}
+            return {**_neutral, "reason": str(e)}
 
     if len(analysis_df) < 5:
-        return {"verdict": "HOLD", "entry": False, "exit": False,
-                "timestamp": None, "close": 0.0, "candles_used": len(analysis_df),
+        return {**_neutral, "candles_used": len(analysis_df),
                 "reason": "Insufficient candle data for indicators"}
 
     recipe = load_recipe(strategy_id)
@@ -390,17 +386,14 @@ async def analyze(strategy_id: str):
         raise HTTPException(404, f"Strategy '{strategy_id}' not found in vault")
 
     try:
-        signals = compile_signals(recipe, analysis_df)
-        entry = bool(signals["entries"].iloc[-1])
-        exit_ = bool(signals["exits"].iloc[-1])
-
-        verdict = "BUY" if entry else ("SELL" if exit_ else "HOLD")
+        dir_signal = compile_direction_signal(recipe, analysis_df)
+        direction = str(dir_signal.iloc[-1])  # "long", "short", or "neutral"
+        verdict = direction.upper()  # "LONG", "SHORT", "NEUTRAL"
 
         last_ts = analysis_df["timestamp"].iloc[-1]
         return {
             "verdict":      verdict,
-            "entry":        entry,
-            "exit":         exit_,
+            "direction":    direction,
             "timestamp":    last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
             "close":        float(analysis_df["close"].iloc[-1]),
             "candles_used": len(analysis_df),
@@ -408,9 +401,7 @@ async def analyze(strategy_id: str):
         }
     except Exception as e:
         log.error("Strategy analyze error for %s: %s", strategy_id, e)
-        return {"verdict": "HOLD", "entry": False, "exit": False,
-                "timestamp": None, "close": 0.0, "candles_used": len(analysis_df),
-                "reason": str(e)}
+        return {**_neutral, "candles_used": len(analysis_df), "reason": str(e)}
 
 
 @router.get("/quotes")
@@ -424,16 +415,11 @@ async def get_quotes(history: int = 50):
             quote = {"timestamp": now, "open": 0, "high": 0, "low": 0,
                      "close": 0, "volume": 0, "ltp": 0}
 
-        # Return recent DB candles as chart context (best-effort)
         hist: list[dict] = []
-        if state.underlying in SPOT_TOKENS:
-            try:
-                token = get_token(state.underlying)
-                df = get_candles(token, state.interval)
-                if not df.empty:
-                    hist = [_row_to_dict(r) for _, r in df.tail(history).iterrows()]
-            except Exception:
-                pass
+        if state.underlying in LIVE_SPOT_TOKENS:
+            live_df = get_live_candles(state.underlying, state.interval, history)
+            if not live_df.empty:
+                hist = [_row_to_dict(r) for _, r in live_df.iterrows()]
 
         return {
             "mode":         "live",

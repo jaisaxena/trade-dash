@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import date
 
 from fastapi import APIRouter, HTTPException, Query
@@ -8,7 +10,12 @@ from pydantic import BaseModel
 
 from config import settings
 from modules.data import kite_client, instruments, downloader
+from modules.data.kite_client import KiteAuthError
+from modules.data.downloader import SyncCancelledError
 from modules.data.sync import smart_sync, smart_sync_full_history, get_data_status, UNDERLYING_CONFIG
+from modules.data.sync_state import sync_tracker
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -109,10 +116,11 @@ async def set_token(body: AccessTokenRequest):
 
 @router.get("/auth/status")
 async def auth_status():
-    return {"authenticated": kite_client.is_authenticated()}
+    valid = kite_client.validate_session()
+    return {"authenticated": valid}
 
 
-# ── Smart Sync ────────────────────────────────────────────────────────
+# ── Smart Sync (background thread) ────────────────────────────────────
 
 class SyncRequest(BaseModel):
     underlyings: list[str] = ["NIFTY", "BANKNIFTY"]
@@ -121,23 +129,75 @@ class SyncRequest(BaseModel):
     to_date: date | None = None
 
 
-@router.post("/sync")
-async def sync_data(body: SyncRequest):
-    """Smart sync: pick underlyings by name — no tokens needed."""
-    results = smart_sync(body.underlyings, body.intervals, body.from_date, body.to_date)
-    return {"synced": results}
-
-
 class SyncFullRequest(BaseModel):
     underlyings: list[str] = ["NIFTY", "BANKNIFTY"]
     intervals: list[str] = ["15m", "day"]
 
 
+def _run_sync_in_background(mode: str, underlyings: list[str], intervals: list[str],
+                            from_date: date | None = None, to_date: date | None = None) -> None:
+    """Worker function executed in a background thread."""
+    try:
+        if mode == "full":
+            smart_sync_full_history(underlyings, intervals)
+        else:
+            smart_sync(underlyings, intervals, from_date, to_date)
+        sync_tracker.finish()
+    except KiteAuthError as e:
+        sync_tracker.finish(error=f"Kite session expired: {e}")
+    except SyncCancelledError:
+        sync_tracker.finish()
+    except Exception as e:
+        log.exception("Sync thread crashed")
+        sync_tracker.finish(error=str(e))
+
+
+@router.post("/sync")
+async def sync_data(body: SyncRequest):
+    """Launch a date-range sync in the background."""
+    if sync_tracker.is_active:
+        raise HTTPException(409, "A sync is already in progress. Cancel it first or wait for it to finish.")
+    if not kite_client.validate_session():
+        raise HTTPException(401, "Kite session is invalid or expired. Please re-login.")
+    sync_tracker.start("range", body.underlyings, body.intervals)
+    t = threading.Thread(
+        target=_run_sync_in_background,
+        args=("range", body.underlyings, body.intervals, body.from_date, body.to_date),
+        daemon=True,
+    )
+    t.start()
+    return {"started": True}
+
+
 @router.post("/sync/full")
 async def sync_full_history(body: SyncFullRequest):
-    """Sync ALL available history: walks backwards until Kite returns nothing."""
-    results = smart_sync_full_history(body.underlyings, body.intervals)
-    return {"synced": results}
+    """Launch a full-history sync in the background."""
+    if sync_tracker.is_active:
+        raise HTTPException(409, "A sync is already in progress. Cancel it first or wait for it to finish.")
+    if not kite_client.validate_session():
+        raise HTTPException(401, "Kite session is invalid or expired. Please re-login.")
+    sync_tracker.start("full", body.underlyings, body.intervals)
+    t = threading.Thread(
+        target=_run_sync_in_background,
+        args=("full", body.underlyings, body.intervals),
+        daemon=True,
+    )
+    t.start()
+    return {"started": True}
+
+
+@router.get("/sync/status")
+async def sync_status():
+    """Poll current sync progress."""
+    return sync_tracker.snapshot()
+
+
+@router.post("/sync/cancel")
+async def sync_cancel():
+    """Request cancellation of the running sync."""
+    if sync_tracker.cancel():
+        return {"cancelled": True}
+    raise HTTPException(404, "No active sync to cancel.")
 
 
 @router.get("/status")

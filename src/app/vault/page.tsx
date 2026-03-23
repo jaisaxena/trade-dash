@@ -103,6 +103,9 @@ export default function VaultPage() {
               {/* Actions */}
               <div style={{ display: "flex", gap: 6 }}>
                 <button className="btn btn-ghost btn-sm" onClick={() => viewRecipe(s.id)}>View JSON</button>
+                {!s.is_frozen && (
+                  <a href={`/strategies?edit=${s.id}`} className="btn btn-ghost btn-sm" style={{ textDecoration: "none", color: "var(--accent-hi)" }}>Edit</a>
+                )}
                 {s.is_frozen
                   ? <button className="btn btn-ghost btn-sm" style={{ color: "var(--yellow-hi)" }} onClick={() => unfreezeMutation.mutate(s.id)}>Unfreeze</button>
                   : <button className="btn btn-ghost btn-sm" style={{ color: "var(--green-hi)", borderColor: "var(--green)44" }} onClick={() => freezeMutation.mutate(s.id)}>🔒 Freeze</button>

@@ -65,6 +65,10 @@ def load_recipe(strategy_id: str, version: int | None = None) -> StrategyRecipe 
         return None
 
     data = json.loads(path.read_text())
+    # Migrate old recipes that have "structure" but not the new directional fields
+    if data.get("structure") and not data.get("long_structure"):
+        data["long_structure"] = data["structure"]
+        data["short_structure"] = data["structure"]
     return StrategyRecipe(**data)
 
 

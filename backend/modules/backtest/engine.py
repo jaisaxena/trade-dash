@@ -1,7 +1,8 @@
 """Vectorized backtesting engine.
 
-Uses VectorBT for fast signal-based backtesting of the underlying,
-then layers on options P&L simulation for the actual strategy legs.
+Uses a direction-based state machine (None → long / short) that enters
+the appropriate leg structure when a directional signal fires and exits
+on reversal, general exits, target/stop/time conditions.
 """
 
 from __future__ import annotations
@@ -32,8 +33,8 @@ import pandas as pd
 import vectorbt as vbt
 
 from db import get_conn
-from modules.strategy.models import StrategyRecipe, ExitType
-from modules.strategy.builder import compile_signals
+from modules.strategy.models import StrategyRecipe, OptionStructure, ExitType
+from modules.strategy.builder import compile_direction_signal, compile_exit_signals, compile_exit_indicator_signals
 from modules.backtest.options_pnl import price_option, simulate_leg_pnl
 from modules.backtest.metrics import compute_all_metrics
 
@@ -71,26 +72,28 @@ def run_backtest(
     initial_capital: float = 100_000,
     interval: str = "15minute",
 ) -> dict:
-    """Run a full backtest: signal generation → trade simulation → metrics.
-
-    Returns a dict with metrics, equity curve, and trade log.
-    """
-    signals = compile_signals(recipe, df, param_overrides)
-    entries = signals["entries"]
-    exits = signals["exits"]
+    """Run a full backtest: direction signals → trade simulation → metrics."""
+    direction_signal = compile_direction_signal(recipe, df, param_overrides)
+    general_exits = compile_exit_signals(recipe, df, param_overrides)
+    ind_exits = compile_exit_indicator_signals(recipe, df, param_overrides)
+    long_exit_signal  = ind_exits["long_exit"]
+    short_exit_signal = ind_exits["short_exit"]
 
     lot_size = LOT_SIZES.get(recipe.underlying, 25)
     bpd = _bars_per_day(interval)
 
-    target_pct = None
-    stop_pct = None
-    max_bars = None
+    target_pct       = None
+    stop_pct         = None
+    trailing_stop_pct = None
+    max_bars         = None
 
     for ec in recipe.exit_conditions:
         if ec.type == ExitType.TARGET_PCT and ec.value is not None:
             target_pct = float(ec.value) / 100
         elif ec.type == ExitType.STOP_PCT and ec.value is not None:
             stop_pct = float(ec.value) / 100
+        elif ec.type == ExitType.TRAILING_STOP_PCT and ec.value is not None:
+            trailing_stop_pct = float(ec.value) / 100
         elif ec.type == ExitType.MAX_HOLDING_BARS and ec.value is not None:
             max_bars = int(ec.value)
 
@@ -98,80 +101,120 @@ def run_backtest(
     trades = []
     equity = [initial_capital]
     current_capital = initial_capital
-    in_trade = False
+
+    active_dir: str | None = None  # "long" or "short"
     entry_idx = 0
     entry_spot = 0.0
+    peak_pnl_pct: float = 0.0  # high water mark for trailing stop
+
+    def _get_structure(d: str) -> OptionStructure:
+        return recipe.long_structure if d == "long" else recipe.short_structure
+
+    def _close_trade(bar_i: int, reason: str):
+        nonlocal current_capital, active_dir, entry_idx, entry_spot, peak_pnl_pct
+        structure = _get_structure(active_dir)  # type: ignore[arg-type]
+        trade_pnl = _compute_trade_pnl(
+            structure, recipe.underlying, entry_spot, close[bar_i],
+            lot_size, (bar_i - entry_idx) / bpd / 365,
+        )
+        ctx = 15
+        ctx_start = max(0, entry_idx - ctx)
+        ctx_end = min(len(df), bar_i + ctx + 1)
+        window = df.iloc[ctx_start:ctx_end]
+        candles = [
+            {
+                "time": int(pd.Timestamp(row["timestamp"]).timestamp()),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+            for _, row in window.iterrows()
+        ]
+        trades.append({
+            "entry_bar": entry_idx,
+            "exit_bar": bar_i,
+            "entry_time": str(df["timestamp"].iloc[entry_idx])[:19],
+            "exit_time": str(df["timestamp"].iloc[bar_i])[:19],
+            "entry_price": entry_spot,
+            "exit_price": close[bar_i],
+            "pnl": trade_pnl,
+            "bars_held": bar_i - entry_idx,
+            "direction": active_dir,
+            "exit_reason": reason,
+            "entry_offset": entry_idx - ctx_start,
+            "exit_offset": bar_i - ctx_start,
+            "candles": candles,
+        })
+        current_capital += trade_pnl
+        active_dir = None
+        peak_pnl_pct = 0.0
+
+    def _open_trade(bar_i: int, d: str):
+        nonlocal active_dir, entry_idx, entry_spot, peak_pnl_pct
+        active_dir = d
+        entry_idx = bar_i
+        entry_spot = close[bar_i]
+        peak_pnl_pct = 0.0
 
     for i in range(len(df)):
-        if not in_trade and entries.iloc[i]:
-            in_trade = True
-            entry_idx = i
-            entry_spot = close[i]
+        sig = direction_signal.iloc[i]
 
-        elif in_trade:
-            should_exit = exits.iloc[i]
+        if active_dir is None:
+            if sig in ("long", "short"):
+                _open_trade(i, sig)
+        else:
+            # ── Indicator-based directional exit (fires before direction change) ──
+            ind_exit = (
+                (active_dir == "long"  and bool(long_exit_signal.iloc[i])) or
+                (active_dir == "short" and bool(short_exit_signal.iloc[i]))
+            )
+            if ind_exit:
+                _close_trade(i, "indicator_exit")
+                # Re-enter if there is also an entry signal in the other direction
+                if sig not in ("neutral", active_dir if active_dir else ""):
+                    _open_trade(i, sig)
+            # ── Direction reversal ────────────────────────────────────────────
+            elif sig != "neutral" and sig != active_dir:
+                _close_trade(i, "direction_change")
+                _open_trade(i, sig)
+            else:
+                should_exit = bool(general_exits.iloc[i])
+                exit_reason = "indicator"
 
-            if not should_exit and max_bars and (i - entry_idx) >= max_bars:
-                should_exit = True
-
-            if not should_exit and target_pct:
-                leg_pnl_pct = _estimate_position_pnl_pct(
-                    recipe, entry_spot, close[i], lot_size,
-                    (i - entry_idx) / bpd / 365,
-                )
-                if leg_pnl_pct >= target_pct:
+                if not should_exit and max_bars and (i - entry_idx) >= max_bars:
                     should_exit = True
+                    exit_reason = "max_bars"
 
-            if not should_exit and stop_pct:
-                leg_pnl_pct = _estimate_position_pnl_pct(
-                    recipe, entry_spot, close[i], lot_size,
-                    (i - entry_idx) / bpd / 365,
-                )
-                if leg_pnl_pct <= -stop_pct:
+                # Compute option P&L % once if needed by target/stop/trailing
+                need_pnl = (target_pct or stop_pct or trailing_stop_pct) and not should_exit
+                leg_pnl_pct: float = 0.0
+                if need_pnl:
+                    leg_pnl_pct = _estimate_position_pnl_pct(
+                        _get_structure(active_dir), recipe.underlying,
+                        entry_spot, close[i], lot_size, (i - entry_idx) / bpd / 365,
+                    )
+
+                if not should_exit and target_pct and leg_pnl_pct >= target_pct:
                     should_exit = True
+                    exit_reason = "target"
 
-            if should_exit:
-                trade_pnl = _compute_trade_pnl(
-                    recipe, entry_spot, close[i], lot_size,
-                    (i - entry_idx) / bpd / 365,
-                )
-                # Build a candle window around this trade (15 bars context each side)
-                ctx = 15
-                ctx_start = max(0, entry_idx - ctx)
-                ctx_end = min(len(df), i + ctx + 1)
-                window = df.iloc[ctx_start:ctx_end]
-                candles = [
-                    {
-                        "time": int(pd.Timestamp(row["timestamp"]).timestamp()),
-                        "open": float(row["open"]),
-                        "high": float(row["high"]),
-                        "low": float(row["low"]),
-                        "close": float(row["close"]),
-                    }
-                    for _, row in window.iterrows()
-                ]
-                trades.append({
-                    "entry_bar": entry_idx,
-                    "exit_bar": i,
-                    "entry_time": str(df["timestamp"].iloc[entry_idx])[:19],
-                    "exit_time": str(df["timestamp"].iloc[i])[:19],
-                    "entry_price": entry_spot,
-                    "exit_price": close[i],
-                    "pnl": trade_pnl,
-                    "bars_held": i - entry_idx,
-                    "entry_offset": entry_idx - ctx_start,
-                    "exit_offset": i - ctx_start,
-                    "candles": candles,
-                })
-                current_capital += trade_pnl
-                in_trade = False
+                if not should_exit and stop_pct and leg_pnl_pct <= -stop_pct:
+                    should_exit = True
+                    exit_reason = "stop"
+
+                if not should_exit and trailing_stop_pct:
+                    if leg_pnl_pct > peak_pnl_pct:
+                        peak_pnl_pct = leg_pnl_pct
+                    # Only trigger once peak has gone positive (locked in some profit)
+                    if peak_pnl_pct > 0 and leg_pnl_pct < peak_pnl_pct - trailing_stop_pct:
+                        should_exit = True
+                        exit_reason = "trailing_stop"
+
+                if should_exit:
+                    _close_trade(i, exit_reason)
 
         equity.append(current_capital)
-
-    # equity is now: [initial_capital, after_bar_0, ..., after_bar_{N-1}]
-    # Keep all N+1 points: the seed (initial_capital) is always the correct
-    # starting value, and the last element captures the final bar's P&L.
-    # (The old equity[:len(df)] slice was dropping the last bar's realized trade.)
 
     equity_series = pd.Series(equity, dtype=float)
     trade_pnls = [t["pnl"] for t in trades]
@@ -186,17 +229,21 @@ def run_backtest(
 
 
 def _estimate_position_pnl_pct(
-    recipe: StrategyRecipe,
+    structure: OptionStructure,
+    underlying: str,
     entry_spot: float,
     current_spot: float,
     lot_size: int,
     tte_elapsed_years: float,
 ) -> float:
     """Quick P&L % estimate for target/stop checks."""
-    total_pnl = _compute_trade_pnl(recipe, entry_spot, current_spot, lot_size, tte_elapsed_years)
+    total_pnl = _compute_trade_pnl(
+        structure, underlying, entry_spot, current_spot,
+        lot_size, tte_elapsed_years,
+    )
     total_premium = 0
-    for leg in recipe.structure.legs:
-        strike = _resolve_strike(entry_spot, leg.strike.value, recipe.underlying)
+    for leg in structure.legs:
+        strike = _resolve_strike(entry_spot, leg.strike.value, underlying)
         op = price_option(entry_spot, strike, 5 / 365, leg.option_type.value)
         total_premium += op.premium * lot_size * leg.lots
 
@@ -206,7 +253,8 @@ def _estimate_position_pnl_pct(
 
 
 def _compute_trade_pnl(
-    recipe: StrategyRecipe,
+    structure: OptionStructure,
+    underlying: str,
     entry_spot: float,
     exit_spot: float,
     lot_size: int,
@@ -214,10 +262,10 @@ def _compute_trade_pnl(
     initial_tte_years: float = 5 / 365,
     iv: float = 0.20,
 ) -> float:
-    """Compute total P&L across all legs using Black-Scholes."""
+    """Compute total P&L across all legs in a structure using Black-Scholes."""
     total = 0.0
-    for leg in recipe.structure.legs:
-        strike = _resolve_strike(entry_spot, leg.strike.value, recipe.underlying)
+    for leg in structure.legs:
+        strike = _resolve_strike(entry_spot, leg.strike.value, underlying)
         ot = leg.option_type.value
         sign = 1 if leg.action.value == "BUY" else -1
 

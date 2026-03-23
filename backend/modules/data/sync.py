@@ -9,7 +9,9 @@ import logging
 from datetime import date, timedelta
 
 from db import get_conn
-from modules.data.downloader import download_candles, download_full_history, KITE_INTERVAL_MAP
+from modules.data.downloader import download_candles, download_full_history, SyncCancelledError, KITE_INTERVAL_MAP
+from modules.data.kite_client import validate_session, KiteAuthError
+from modules.data.sync_state import sync_tracker
 
 log = logging.getLogger(__name__)
 
@@ -72,15 +74,15 @@ def smart_sync(
 ) -> dict[str, dict[str, int]]:
     """Download candles for a list of underlyings × intervals.
 
-    Args:
-        underlyings: e.g. ["NIFTY", "BANKNIFTY"]
-        intervals:   e.g. ["15m", "day"]
-        from_date:   defaults to 60 trading days back
-        to_date:     defaults to today
+    Reports progress via sync_tracker and respects cancellation.
 
-    Returns:
-        {underlying: {interval: rows_inserted}}
+    Raises:
+        KiteAuthError: if Kite session is invalid/expired (aborts immediately).
+        SyncCancelledError: if cancelled by user.
     """
+    if not validate_session():
+        raise KiteAuthError("Kite session is invalid or expired. Please re-login.")
+
     if to_date is None:
         to_date = date.today()
     if from_date is None:
@@ -92,13 +94,17 @@ def smart_sync(
         token = get_token(underlying)
         results[underlying] = {}
         for interval in intervals:
+            sync_tracker.begin_step(underlying, interval)
             try:
                 count = download_candles(token, interval, from_date, to_date)
                 results[underlying][interval] = count
-                log.info("Synced %s %s: %d rows", underlying, interval, count)
+                sync_tracker.complete_step(underlying, interval, count)
+            except (KiteAuthError, SyncCancelledError):
+                raise
             except Exception as e:
                 log.error("Failed %s %s: %s", underlying, interval, e)
                 results[underlying][interval] = -1
+                sync_tracker.complete_step(underlying, interval, -1)
 
     return results
 
@@ -109,22 +115,32 @@ def smart_sync_full_history(
 ) -> dict[str, dict[str, int]]:
     """Sync all available history for underlyings × intervals.
 
-    Walks backwards from the oldest stored candle until Kite returns
-    empty responses, then also syncs forward to today.
+    Reports progress via sync_tracker and respects cancellation.
+
+    Raises:
+        KiteAuthError: if Kite session is invalid/expired (aborts immediately).
+        SyncCancelledError: if cancelled by user.
     """
+    if not validate_session():
+        raise KiteAuthError("Kite session is invalid or expired. Please re-login.")
+
     results: dict[str, dict[str, int]] = {}
     for underlying in underlyings:
         underlying = underlying.upper()
         token = get_token(underlying)
         results[underlying] = {}
         for interval in intervals:
+            sync_tracker.begin_step(underlying, interval)
             try:
                 count = download_full_history(token, interval)
                 results[underlying][interval] = count
-                log.info("Full-history sync %s %s: %d rows", underlying, interval, count)
+                sync_tracker.complete_step(underlying, interval, count)
+            except (KiteAuthError, SyncCancelledError):
+                raise
             except Exception as e:
                 log.error("Full-history failed %s %s: %s", underlying, interval, e)
                 results[underlying][interval] = -1
+                sync_tracker.complete_step(underlying, interval, -1)
     return results
 
 
@@ -142,18 +158,22 @@ def get_data_status() -> dict:
         token = cfg["token"]
         intervals: dict[str, dict | None] = {}
         for kite_iv, label in display_intervals.items():
-            row = conn.execute(
-                "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM candles "
-                "WHERE instrument_token = ? AND interval = ?",
-                [token, kite_iv],
-            ).fetchone()
-            if row and row[0] > 0:
-                intervals[label] = {
-                    "count": row[0],
-                    "from":  str(row[1])[:10] if row[1] else None,
-                    "to":    str(row[2])[:10] if row[2] else None,
-                }
-            else:
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM candles "
+                    "WHERE instrument_token = ? AND interval = ?",
+                    [token, kite_iv],
+                ).fetchone()
+                if row and row[0] > 0:
+                    intervals[label] = {
+                        "count": row[0],
+                        "from":  str(row[1])[:10] if row[1] else None,
+                        "to":    str(row[2])[:10] if row[2] else None,
+                    }
+                else:
+                    intervals[label] = None
+            except Exception as e:
+                log.error("Error reading candle status for %s %s: %s", underlying, kite_iv, e)
                 intervals[label] = None
         result[underlying] = {
             "display_name": cfg["display_name"],
