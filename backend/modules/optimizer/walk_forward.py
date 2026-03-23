@@ -28,6 +28,7 @@ def walk_forward(
     n_jobs: int = -1,
     max_random: int | None = None,
     run_id: str | None = None,
+    interval_dfs: dict[str, pd.DataFrame] | None = None,
 ) -> dict:
     """Run walk-forward optimization.
 
@@ -81,6 +82,7 @@ def walk_forward(
         is_results = grid_search(
             recipe, is_data, initial_capital, interval, n_jobs, max_random,
             progress_callback=_callback if run_id else None,
+            interval_dfs=interval_dfs,
         )
 
         if not is_results:
@@ -92,7 +94,7 @@ def walk_forward(
         best_params = is_results[0]["params"]
         best_is_metrics = is_results[0]["metrics"]
 
-        oos_result = run_backtest(recipe, oos_data, best_params, initial_capital, interval)
+        oos_result = run_backtest(recipe, oos_data, best_params, initial_capital, interval, interval_dfs)
 
         windows.append({
             "window": i,

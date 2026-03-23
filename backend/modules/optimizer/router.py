@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from config import settings
 from db import get_conn
 from modules.strategy.models import StrategyRecipe
+from modules.strategy.builder import get_required_intervals
 from modules.data.downloader import get_candles
 from modules.data.sync import get_token
 from modules.optimizer.grid_search import grid_search, get_combos
@@ -20,6 +21,7 @@ from modules.optimizer.successive_halving import (
     successive_halving, DEFAULT_BUDGETS, DEFAULT_ETA,
 )
 from modules.optimizer import progress as prog
+from modules.optimizer.progress import is_cancelled
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ def _run_optimizer_sync(
     body: OptimizeRequest,
     df,
     kite_interval: str,
+    interval_dfs: dict | None = None,
 ) -> dict:
     """Core optimization loop — runs inside a background thread."""
 
@@ -59,21 +62,21 @@ def _run_optimizer_sync(
         result = walk_forward(
             body.recipe, df, body.n_splits, body.is_ratio,
             body.initial_capital, kite_interval, body.n_jobs, body.max_random,
-            run_id=run_id,
+            run_id=run_id, interval_dfs=interval_dfs,
         )
     elif body.mode == "successive_halving":
         result = successive_halving(
             body.recipe, df, body.initial_capital, kite_interval,
             body.n_jobs, body.max_random,
             budgets=body.sh_budgets, eta=body.sh_eta,
-            run_id=run_id,
+            run_id=run_id, interval_dfs=interval_dfs,
         )
     else:
         max_random_val = body.max_random if body.mode == "random" else None
         results = grid_search(
             body.recipe, df, body.initial_capital, kite_interval,
             body.n_jobs, max_random_val,
-            progress_callback=callback,
+            progress_callback=callback, interval_dfs=interval_dfs,
         )
         result = {"ranked_results": results[:100]}
 
@@ -85,12 +88,13 @@ def _run_in_thread(
     body: OptimizeRequest,
     df,
     kite_interval: str,
+    interval_dfs: dict | None = None,
 ) -> None:
     """Background thread: runs the optimizer and writes result to a fresh
     DuckDB connection (thread-safe: each thread owns its connection)."""
     print(f"[optimizer] thread {threading.current_thread().name} started for run {run_id}", flush=True)
     try:
-        result = _run_optimizer_sync(run_id, body, df, kite_interval)
+        result = _run_optimizer_sync(run_id, body, df, kite_interval, interval_dfs)
 
         if body.mode == "walk_forward":
             best_params = result.get("recommended_params", {})
@@ -102,6 +106,11 @@ def _run_in_thread(
 
         # Each thread opens its own DuckDB connection — no sharing with the
         # main thread's get_conn() singleton.
+        # Skip if the user cancelled while we were computing.
+        if is_cancelled(run_id):
+            print(f"[optimizer] run {run_id} was cancelled — skipping DB write", flush=True)
+            return
+
         try:
             thread_conn = duckdb.connect(str(settings.DUCKDB_PATH))
             thread_conn.execute(
@@ -145,6 +154,12 @@ async def run_optimization(body: OptimizeRequest):
             f"No {body.interval} data for {body.recipe.underlying}. "
             f"Download it in the Data module first."
         )
+
+    interval_dfs: dict = {}
+    for iv in get_required_intervals(body.recipe):
+        htf_df = get_candles(token, iv)
+        if not htf_df.empty:
+            interval_dfs[iv] = htf_df
 
     date_from = str(df["timestamp"].min())[:10]
     date_to = str(df["timestamp"].max())[:10]
@@ -195,7 +210,7 @@ async def run_optimization(body: OptimizeRequest):
     # no GIL issues, no asyncio executor queue.
     t = threading.Thread(
         target=_run_in_thread,
-        args=(run_id, body, df, kite_interval),
+        args=(run_id, body, df, kite_interval, interval_dfs),
         daemon=True,
         name=f"optimizer-{run_id}",
     )
@@ -232,16 +247,76 @@ async def get_run_progress(run_id: str):
     ).fetchone()
     if not row:
         raise HTTPException(404, "Run not found")
+
+    db_status = row[0]
+    # If DB still says "running" but the in-memory store is gone, the server
+    # restarted and the thread is dead — auto-recover as a cancelled run.
+    if db_status == "running":
+        db_status = "failed"
+        try:
+            conn.execute(
+                "UPDATE optimization_runs SET status = 'failed', "
+                "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                [run_id],
+            )
+        except Exception:
+            pass
+
     return {
         "run_id": run_id,
-        "status": row[0],
+        "status": db_status,
         "total": row[1],
         "completed": row[2] or 0,
         "current_params": None,
         "partial_results": [],
         "all_combos": [],
+        "error": "Server restarted — run was lost. Start a new run." if db_status == "failed" else None,
         "final_result": json.loads(row[3]) if row[3] else None,
     }
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str):
+    """Cancel a specific running optimization. The background thread may still
+    finish its current batch, but the DB and UI status are updated immediately."""
+    prog.cancel(run_id)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT status FROM optimization_runs WHERE id = ?", [run_id]
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Run not found")
+
+    conn.execute(
+        "UPDATE optimization_runs SET status = 'failed', "
+        "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [run_id],
+    )
+    return {"cancelled": True, "run_id": run_id}
+
+
+@router.post("/cancel-all")
+async def cancel_all_runs():
+    """Force-cancel every run that is still marked as running in the DB.
+    Useful after a server restart where orphaned runs would otherwise stay
+    stuck forever in the UI."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id FROM optimization_runs WHERE status = 'running'"
+    ).fetchall()
+
+    cancelled_ids = [r[0] for r in rows]
+    for rid in cancelled_ids:
+        prog.cancel(rid)
+
+    if cancelled_ids:
+        conn.execute(
+            "UPDATE optimization_runs SET status = 'failed', "
+            "completed_at = CURRENT_TIMESTAMP WHERE status = 'running'"
+        )
+
+    return {"cancelled": len(cancelled_ids), "run_ids": cancelled_ids}
 
 
 @router.get("/runs")

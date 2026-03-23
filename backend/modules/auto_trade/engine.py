@@ -56,6 +56,55 @@ def _get_feed_df():
         return None, date_type.today()
 
 
+# ── Multi-timeframe feed helper ───────────────────────────────────────────────
+
+def _get_interval_dfs(required_intervals: set[str]) -> dict:
+    """Fetch higher-timeframe DataFrames needed by a multi-TF strategy."""
+    if not required_intervals:
+        return {}
+
+    from modules.feed.feed_state import get_state as get_feed_state
+    from modules.data.downloader import get_candles
+    from modules.data.sync import get_token, SPOT_TOKENS
+
+    feed = get_feed_state()
+    interval_dfs: dict = {}
+
+    if feed.mode == "replay":
+        if feed.candles_df is None or feed.replay_state == "idle":
+            return {}
+        from modules.feed.replay_feed import _candle_idx
+        idx = min(_candle_idx(feed), len(feed.candles_df) - 1)
+        end_ts = feed.candles_df.iloc[idx]["timestamp"]
+        underlying = feed.underlying
+        if underlying not in SPOT_TOKENS:
+            return {}
+        try:
+            token = get_token(underlying)
+            for iv in required_intervals:
+                htf_df = get_candles(token, iv)
+                if not htf_df.empty:
+                    htf_df = htf_df[htf_df["timestamp"] <= end_ts].tail(500).reset_index(drop=True)
+                    if not htf_df.empty:
+                        interval_dfs[iv] = htf_df
+        except Exception:
+            pass
+    else:
+        underlying = feed.underlying
+        if underlying not in SPOT_TOKENS:
+            return {}
+        try:
+            token = get_token(underlying)
+            for iv in required_intervals:
+                htf_df = get_candles(token, iv)
+                if not htf_df.empty:
+                    interval_dfs[iv] = htf_df.tail(500).reset_index(drop=True)
+        except Exception:
+            pass
+
+    return interval_dfs
+
+
 # ── Signal evaluation ────────────────────────────────────────────────────────
 
 def _run_signals(strategy_id: str) -> dict:
@@ -65,6 +114,7 @@ def _run_signals(strategy_id: str) -> dict:
         compile_direction_signal,
         compile_exit_signals,
         compile_exit_indicator_signals,
+        get_required_intervals,
     )
 
     df, ref_date = _get_feed_df()
@@ -80,9 +130,10 @@ def _run_signals(strategy_id: str) -> dict:
                 "ref_date": ref_date, "reason": f"Strategy '{strategy_id}' not found"}
 
     try:
-        dir_signal   = compile_direction_signal(recipe, df)
-        exit_signal  = compile_exit_signals(recipe, df)
-        ind_exits    = compile_exit_indicator_signals(recipe, df)
+        interval_dfs = _get_interval_dfs(get_required_intervals(recipe))
+        dir_signal   = compile_direction_signal(recipe, df, interval_dfs=interval_dfs)
+        exit_signal  = compile_exit_signals(recipe, df, interval_dfs=interval_dfs)
+        ind_exits    = compile_exit_indicator_signals(recipe, df, interval_dfs=interval_dfs)
         return {
             "direction":   str(dir_signal.iloc[-1]),
             "general_exit": bool(exit_signal.iloc[-1]),

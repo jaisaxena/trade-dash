@@ -5,10 +5,12 @@ from fastapi import APIRouter, HTTPException
 
 from modules.strategy.models import StrategyRecipe
 from modules.strategy.indicators import INDICATOR_REGISTRY, compute_indicator
-from modules.strategy.builder import compile_signals
+from modules.strategy.builder import compile_signals, get_required_intervals
 from modules.data.downloader import get_candles
 
 router = APIRouter()
+
+VALID_INTERVALS = {"1m", "5m", "15m", "1h", "day"}
 
 
 @router.get("/indicators")
@@ -51,7 +53,13 @@ async def compile_strategy(
     if df.empty:
         raise HTTPException(404, "No candle data found")
 
-    signals = compile_signals(recipe, df, param_overrides)
+    interval_dfs: dict = {}
+    for iv in get_required_intervals(recipe):
+        htf_df = get_candles(instrument_token, iv)
+        if not htf_df.empty:
+            interval_dfs[iv] = htf_df
+
+    signals = compile_signals(recipe, df, param_overrides, interval_dfs)
     entry_count = int(signals["entries"].sum())
     exit_count = int(signals["exits"].sum())
 
@@ -66,8 +74,9 @@ async def compile_strategy(
 async def validate_recipe(recipe: StrategyRecipe):
     """Validate a recipe schema without running it."""
     errors = []
+    var_names = {v.name for v in recipe.indicator_vars}
     for cond in recipe.entry_conditions:
-        if cond.indicator.upper() not in INDICATOR_REGISTRY:
+        if cond.indicator not in var_names and cond.indicator.upper() not in INDICATOR_REGISTRY:
             errors.append(f"Unknown indicator: {cond.indicator}")
     if not recipe.long_structure.legs and not recipe.short_structure.legs:
         errors.append("Strategy must have at least one leg in either long or short structure")
@@ -75,6 +84,10 @@ async def validate_recipe(recipe: StrategyRecipe):
         errors.append("Strategy must have at least one entry condition")
     if not recipe.exit_conditions:
         errors.append("Strategy must have at least one exit condition")
+    for v in recipe.indicator_vars:
+        if v.interval and v.interval not in VALID_INTERVALS:
+            errors.append(f"Invalid interval '{v.interval}' on variable '{v.name}'. "
+                          f"Must be one of: {', '.join(sorted(VALID_INTERVALS))}")
 
     return {
         "valid": len(errors) == 0,

@@ -97,6 +97,24 @@ def supertrend(
     return pd.DataFrame({"supertrend": st, "direction": direction})
 
 
+def supertrend_signal(
+    df: pd.DataFrame,
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> pd.Series:
+    """SuperTrend direction as a plain +1 / -1 Series.
+
+    +1 = bullish trend, -1 = bearish trend.
+
+    Typical usage in conditions:
+      crossover  at 0  → trend just flipped bullish  (−1 → +1)
+      crossunder at 0  → trend just flipped bearish  (+1 → −1)
+      ==         1     → currently in uptrend
+      ==        -1     → currently in downtrend
+    """
+    return supertrend(df, period=period, multiplier=multiplier)["direction"].astype(float)
+
+
 def iv_rank(iv_series: pd.Series, lookback: int = 252) -> pd.Series:
     """IV Rank = (current IV - 52w low) / (52w high - 52w low) * 100"""
     iv_min = iv_series.rolling(lookback, min_periods=1).min()
@@ -160,6 +178,17 @@ def stochastic(
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    # ta allocates len(close) - (period - 1); negative when bars < period
+    # (common: HTF series + short backtest range).
+    if len(df) < period:
+        return pd.DataFrame(
+            {
+                "adx": np.nan,
+                "plus_di": np.nan,
+                "minus_di": np.nan,
+            },
+            index=df.index,
+        )
     indicator = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=period)
     return pd.DataFrame({
         "adx": indicator.adx(),
@@ -178,6 +207,56 @@ def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
     ).williams_r()
 
 
+# ── Opening Range ─────────────────────────────────────────────────────
+# Requires a 'timestamp' column in the DataFrame to group candles by date.
+# The first `n` candles of each trading day define the opening range.
+# Values are NaN during the formation window; after n candles complete,
+# orb_high / orb_low are held constant for the remainder of that day.
+
+def opening_range(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    """Opening range high and low based on the first n candles of each day.
+
+    Returns a DataFrame with columns ``orb_high`` and ``orb_low``.
+    Both are NaN for the first n bars of each day (range still forming)
+    and filled with the day's opening-range extremes from bar n+1 onward.
+    """
+    if "timestamp" not in df.columns:
+        raise ValueError("DataFrame must have a 'timestamp' column for OPENING_RANGE")
+
+    ts = pd.to_datetime(df["timestamp"])
+    date_key = ts.dt.date
+
+    orb_high = pd.Series(np.nan, index=df.index)
+    orb_low  = pd.Series(np.nan, index=df.index)
+
+    for date, day_idx in df.groupby(date_key.values, sort=False).groups.items():
+        sorted_idx = ts.loc[day_idx].sort_values().index
+
+        if len(sorted_idx) <= n:
+            continue  # not enough candles — leave as NaN
+
+        first_n = sorted_idx[:n]
+        rest    = sorted_idx[n:]
+
+        h = df.loc[first_n, "high"].max()
+        l = df.loc[first_n, "low"].min()
+
+        orb_high.loc[rest] = h
+        orb_low.loc[rest]  = l
+
+    return pd.DataFrame({"orb_high": orb_high, "orb_low": orb_low})
+
+
+def opening_range_high(df: pd.DataFrame, n: int = 5) -> pd.Series:
+    """High of the opening range (first n candles of each day)."""
+    return opening_range(df, n)["orb_high"]
+
+
+def opening_range_low(df: pd.DataFrame, n: int = 5) -> pd.Series:
+    """Low of the opening range (first n candles of each day)."""
+    return opening_range(df, n)["orb_low"]
+
+
 # ── Registry ─────────────────────────────────────────────────────────
 # Maps indicator name → callable. Each callable signature:
 #   fn(df, **params) → Series or DataFrame
@@ -191,6 +270,7 @@ INDICATOR_REGISTRY: dict[str, callable] = {
     "ATR": atr,
     "VWAP": vwap,
     "SUPERTREND": supertrend,
+    "SUPERTREND_SIGNAL": supertrend_signal,
     "IV_RANK": iv_rank,
     "IV_PERCENTILE": iv_percentile,
     "PCR": pcr,
@@ -198,6 +278,10 @@ INDICATOR_REGISTRY: dict[str, callable] = {
     "ADX": adx,
     "CCI": cci,
     "WILLIAMS_R": williams_r,
+    # Opening Range Breakout
+    "OPENING_RANGE":      opening_range,
+    "OPENING_RANGE_HIGH": opening_range_high,
+    "OPENING_RANGE_LOW":  opening_range_low,
     # Raw OHLCV — no params required
     "CLOSE":  close,
     "OPEN":   open_,

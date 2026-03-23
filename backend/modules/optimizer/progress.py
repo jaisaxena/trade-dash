@@ -19,6 +19,7 @@ def _sanitize(obj: Any) -> Any:
     return obj
 
 _store: dict[str, dict[str, Any]] = {}
+_cancelled: set[str] = set()
 _lock = threading.Lock()
 
 
@@ -102,6 +103,22 @@ def get_snapshot(run_id: str) -> dict | None:
     return _sanitize(snapshot)
 
 
+def cancel(run_id: str) -> None:
+    """Mark a run as cancelled immediately (UI/DB update); background thread
+    may still finish, but it will not overwrite the cancelled status."""
+    with _lock:
+        _cancelled.add(run_id)
+        if run_id in _store:
+            _store[run_id]["status"] = "failed"
+            _store[run_id]["error"] = "Cancelled by user"
+
+
+def is_cancelled(run_id: str) -> bool:
+    with _lock:
+        return run_id in _cancelled
+
+
 def cleanup(run_id: str) -> None:
     with _lock:
         _store.pop(run_id, None)
+        _cancelled.discard(run_id)

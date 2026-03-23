@@ -4,13 +4,13 @@ import { useState, useEffect, useCallback } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { STRIKE_REFS, formatStrikeRef, type StrikeRef } from "@/lib/strikeLabels";
 
 type Action = "BUY" | "SELL";
 type OType  = "CE" | "PE";
-type Strike = "ATM-5"|"ATM-4"|"ATM-3"|"ATM-2"|"ATM-1"|"ATM+0"|"ATM+1"|"ATM+2"|"ATM+3"|"ATM+4"|"ATM+5";
 type Direction = "long" | "short";
 
-interface Leg { action: Action; option_type: OType; strike: Strike; lots: number }
+interface Leg { action: Action; option_type: OType; strike: StrikeRef; lots: number }
 
 type Operator = "<" | ">" | "<=" | ">=" | "==" | "crossover" | "crossunder";
 
@@ -18,6 +18,7 @@ interface IndicatorVar {
   name: string;       // user-defined, e.g. "fast_ema"
   indicator: string;  // type, e.g. "EMA"
   params: Record<string, number>;
+  interval?: string | null;  // e.g. "1h" — null/undefined = use base interval
 }
 
 interface Entry {
@@ -43,7 +44,7 @@ interface Recipe {
   entry_conditions: Entry[];
   exit_indicator_conditions: Entry[];   // indicator-based directional exits
   exit_conditions: Exit[];
-  param_ranges: Record<string, number[]>;
+  param_ranges: Record<string, (number | string)[]>;
 }
 
 const INDICATORS: Record<string, { params: Record<string, number>; defaultCondition: Operator; defaultValue: number }> = {
@@ -61,11 +62,15 @@ const INDICATORS: Record<string, { params: Record<string, number>; defaultCondit
   BOLLINGER:  { params: { period: 20, std_dev: 2 },                     defaultCondition: "<",  defaultValue: 20 },
   ATR:        { params: { period: 14 },                                 defaultCondition: ">",  defaultValue: 50 },
   VWAP:       { params: {},                                             defaultCondition: ">",  defaultValue: 0 },
-  SUPERTREND: { params: { period: 10, multiplier: 3 },                  defaultCondition: "==", defaultValue: 1 },
+  SUPERTREND:        { params: { period: 10, multiplier: 3 },            defaultCondition: "==",         defaultValue: 1 },
+  SUPERTREND_SIGNAL: { params: { period: 10, multiplier: 3 },            defaultCondition: "crossover",  defaultValue: 0 },
   ADX:        { params: { period: 14 },                                 defaultCondition: ">",  defaultValue: 25 },
   STOCHASTIC: { params: { k_period: 14, d_period: 3 },                  defaultCondition: "<",  defaultValue: 20 },
   CCI:        { params: { period: 20 },                                 defaultCondition: "<",  defaultValue: -100 },
   WILLIAMS_R: { params: { period: 14 },                                 defaultCondition: "<",  defaultValue: -80 },
+  // ── Opening Range Breakout ────────────────────────────────────────
+  OPENING_RANGE_HIGH: { params: { n: 5 }, defaultCondition: "crossover",  defaultValue: 0 },
+  OPENING_RANGE_LOW:  { params: { n: 5 }, defaultCondition: "crossunder", defaultValue: 0 },
 };
 
 const PARAM_RANGE_SUGGESTIONS: Record<string, Record<string, number[]>> = {
@@ -74,8 +79,27 @@ const PARAM_RANGE_SUGGESTIONS: Record<string, Record<string, number[]>> = {
   EMA:        { period: [9, 20, 50, 100] },
   MACD:       { fast: [9, 12, 15], slow: [21, 26, 30], signal: [7, 9, 12] },
   BOLLINGER:  { period: [14, 20, 25], std_dev: [1.5, 2, 2.5] },
-  ADX:        { period: [10, 14, 20] },
-  STOCHASTIC: { k_period: [9, 14, 21] },
+  ADX:               { period: [10, 14, 20] },
+  STOCHASTIC:        { k_period: [9, 14, 21] },
+  SUPERTREND_SIGNAL: { period: [7, 10, 14, 20], multiplier: [2, 3, 4] },
+  OPENING_RANGE_HIGH: { n: [3, 5, 10, 15, 30] },
+  OPENING_RANGE_LOW:  { n: [3, 5, 10, 15, 30] },
+};
+
+// Maps exit condition type → the param_ranges key used by the optimizer.
+const EXIT_RANGE_KEY: Record<string, string> = {
+  target_pct:         "exit.target_pct",
+  stop_pct:           "exit.stop_pct",
+  trailing_stop_pct:  "exit.trailing_stop_pct",
+  time_exit:          "exit.time_exit",
+};
+
+// Default sweep values shown when auto-filling exit param ranges.
+const EXIT_RANGE_DEFAULTS: Record<string, (number | string)[]> = {
+  "exit.target_pct":        [20, 30, 50, 70, 100],
+  "exit.stop_pct":          [10, 15, 20, 30, 50],
+  "exit.trailing_stop_pct": [10, 15, 20, 30],
+  "exit.time_exit":         ["13:30", "14:00", "14:30", "15:00", "15:15"],
 };
 
 const DEFAULT_RECIPE: Recipe = {
@@ -154,8 +178,10 @@ function LegTable({
                 </select>
               </td>
               <td>
-                <select className="input" style={{ padding: "5px 8px", fontFamily: "monospace" }} value={leg.strike} onChange={(e) => onUpdate(i, { strike: e.target.value as Strike })}>
-                  {["ATM-5","ATM-4","ATM-3","ATM-2","ATM-1","ATM+0","ATM+1","ATM+2","ATM+3","ATM+4","ATM+5"].map((s) => <option key={s}>{s}</option>)}
+                <select className="input" style={{ padding: "5px 8px" }} value={leg.strike} onChange={(e) => onUpdate(i, { strike: e.target.value as StrikeRef })}>
+                  {STRIKE_REFS.map((s) => (
+                    <option key={s} value={s}>{formatStrikeRef(s)}</option>
+                  ))}
                 </select>
               </td>
               <td>
@@ -243,7 +269,7 @@ export default function StrategiesPage() {
 
   const addVar = () => {
     const ind = "EMA";
-    update({ indicator_vars: [...vars, { name: "", indicator: ind, params: { ...INDICATORS[ind].params } }] });
+    update({ indicator_vars: [...vars, { name: "", indicator: ind, params: { ...INDICATORS[ind].params }, interval: null }] });
   };
   const updateVar = (i: number, patch: Partial<IndicatorVar>) => {
     update({ indicator_vars: vars.map((v, j) => j === i ? { ...v, ...patch } : v) });
@@ -388,11 +414,16 @@ export default function StrategiesPage() {
         }
       });
     }
+    // Always surface exit condition keys for any exit type that has a sweep key.
+    recipe.exit_conditions.forEach((ec) => {
+      const k = EXIT_RANGE_KEY[ec.type];
+      if (k) keys.add(k);
+    });
     return [...keys];
   };
 
   const autoFillRanges = () => {
-    const ranges: Record<string, number[]> = {};
+    const ranges: Record<string, (number | string)[]> = {};
     if (useVars) {
       vars.forEach((v) => {
         const sugg = PARAM_RANGE_SUGGESTIONS[v.indicator] || {};
@@ -408,6 +439,11 @@ export default function StrategiesPage() {
         }
       });
     }
+    // Also auto-fill exit condition ranges.
+    recipe.exit_conditions.forEach((ec) => {
+      const k = EXIT_RANGE_KEY[ec.type];
+      if (k && EXIT_RANGE_DEFAULTS[k]) ranges[k] = EXIT_RANGE_DEFAULTS[k];
+    });
     update({ param_ranges: ranges });
   };
 
@@ -523,8 +559,8 @@ export default function StrategiesPage() {
             <p style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 10 }}>
               Name each indicator instance once here (e.g. <code style={{ color: "var(--accent-hi)" }}>fast_ema</code>,{" "}
               <code style={{ color: "var(--accent-hi)" }}>slow_ema</code>), then reference them by name in conditions below.
-              The optimizer uses these names as param keys — <code style={{ color: "var(--accent-hi)" }}>fast_ema.period</code> and{" "}
-              <code style={{ color: "var(--accent-hi)" }}>slow_ema.period</code> are fully independent.
+              Set <strong>Interval</strong> to compute an indicator on a different timeframe (e.g. 1h EMA with 5m entries).
+              &quot;Base TF&quot; uses the backtest interval. Higher-TF values are forward-filled (last known value) to avoid lookahead.
             </p>
             {vars.length === 0 && (
               <p style={{ fontSize: 11, color: "var(--text-muted)", fontStyle: "italic" }}>
@@ -547,6 +583,22 @@ export default function StrategiesPage() {
                   <span className="label">Type</span>
                   <select className="input" style={{ width: 120 }} value={v.indicator} onChange={(e) => changeVarIndicator(i, e.target.value)}>
                     {Object.keys(INDICATORS).map((k) => <option key={k}>{k}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <span className="label">Interval</span>
+                  <select
+                    className="input"
+                    style={{ width: 110 }}
+                    value={v.interval ?? ""}
+                    onChange={(e) => updateVar(i, { interval: e.target.value || null })}
+                  >
+                    <option value="">Base TF</option>
+                    <option value="1m">1m</option>
+                    <option value="5m">5m</option>
+                    <option value="15m">15m</option>
+                    <option value="1h">1h</option>
+                    <option value="day">Day</option>
                   </select>
                 </div>
                 {Object.entries(v.params).map(([param, val]) => (
@@ -894,11 +946,13 @@ export default function StrategiesPage() {
                 />
                 <input
                   className="input"
-                  placeholder="comma-separated: 5, 10, 20, 30"
+                  placeholder={key === "exit.time_exit" ? "e.g. 13:30, 14:00, 15:00, 15:15" : "comma-separated: 5, 10, 20, 30"}
                   value={vals.join(", ")}
                   onChange={(e) => {
-                    const nums = e.target.value.split(",").map((v) => parseFloat(v.trim())).filter((n) => !isNaN(n));
-                    update({ param_ranges: { ...recipe.param_ranges, [key]: nums } });
+                    const parsed: (number | string)[] = key === "exit.time_exit"
+                      ? e.target.value.split(",").map((v) => v.trim()).filter(Boolean)
+                      : e.target.value.split(",").map((v) => parseFloat(v.trim())).filter((n) => !isNaN(n));
+                    update({ param_ranges: { ...recipe.param_ranges, [key]: parsed } });
                   }}
                 />
                 <button className="btn btn-ghost btn-sm" style={{ color: "var(--red-hi)", flexShrink: 0 }} onClick={() => {

@@ -71,11 +71,12 @@ def run_backtest(
     param_overrides: dict[str, Any] | None = None,
     initial_capital: float = 100_000,
     interval: str = "15minute",
+    interval_dfs: dict[str, pd.DataFrame] | None = None,
 ) -> dict:
     """Run a full backtest: direction signals → trade simulation → metrics."""
-    direction_signal = compile_direction_signal(recipe, df, param_overrides)
-    general_exits = compile_exit_signals(recipe, df, param_overrides)
-    ind_exits = compile_exit_indicator_signals(recipe, df, param_overrides)
+    direction_signal = compile_direction_signal(recipe, df, param_overrides, interval_dfs)
+    general_exits = compile_exit_signals(recipe, df, param_overrides, interval_dfs)
+    ind_exits = compile_exit_indicator_signals(recipe, df, param_overrides, interval_dfs)
     long_exit_signal  = ind_exits["long_exit"]
     short_exit_signal = ind_exits["short_exit"]
 
@@ -96,6 +97,17 @@ def run_backtest(
             trailing_stop_pct = float(ec.value) / 100
         elif ec.type == ExitType.MAX_HOLDING_BARS and ec.value is not None:
             max_bars = int(ec.value)
+
+    # Apply param_overrides for exit conditions (optimizer sweep support).
+    # Keys: "exit.target_pct", "exit.stop_pct", "exit.trailing_stop_pct".
+    # Values are percentages (e.g. 50 means 50%), consistent with recipe storage.
+    _ov = param_overrides or {}
+    if "exit.target_pct" in _ov:
+        target_pct = float(_ov["exit.target_pct"]) / 100
+    if "exit.stop_pct" in _ov:
+        stop_pct = float(_ov["exit.stop_pct"]) / 100
+    if "exit.trailing_stop_pct" in _ov:
+        trailing_stop_pct = float(_ov["exit.trailing_stop_pct"]) / 100
 
     close = df["close"].values
     trades = []

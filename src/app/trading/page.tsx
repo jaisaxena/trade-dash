@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { createChart, CandlestickSeries, type IChartApi } from "lightweight-charts";
 import { api } from "@/lib/api";
+import { formatStrikeRef } from "@/lib/strikeLabels";
 import { useAppStore } from "@/lib/store";
 
 type Strategy = { id: string; name: string; underlying: string; is_frozen: boolean };
@@ -812,7 +813,7 @@ export default function TradingPage() {
                     >
                       <span style={{ fontWeight: 700, fontFamily: "monospace", color: "var(--accent-hi)" }}>{s.tradingsymbol}</span>
                       <span style={{ marginLeft: 8, color: s.action === "BUY" ? "var(--green-hi)" : "var(--red-hi)", fontWeight: 700 }}>{s.action}</span>
-                      <span style={{ marginLeft: 6, color: "var(--text-muted)" }}>{s.strike_ref} · {s.lots} lot{s.lots > 1 ? "s" : ""}</span>
+                      <span style={{ marginLeft: 6, color: "var(--text-muted)" }}>{formatStrikeRef(s.strike_ref)} · {s.lots} lot{s.lots > 1 ? "s" : ""}</span>
                     </button>
                   ))}
                 </div>

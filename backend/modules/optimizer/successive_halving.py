@@ -69,6 +69,7 @@ def successive_halving(
     budgets: list[float] | None = None,
     eta: int = DEFAULT_ETA,
     run_id: str | None = None,
+    interval_dfs: dict[str, pd.DataFrame] | None = None,
 ) -> dict:
     """Run successive halving over the parameter grid.
 
@@ -132,7 +133,7 @@ def successive_halving(
             return_as="generator_unordered",
             backend="loky",
         )(
-            delayed(_run_single)(recipe, slice_df, combo, initial_capital, interval)
+            delayed(_run_single)(recipe, slice_df, combo, initial_capital, interval, interval_dfs)
             for combo in combos_this_stage
         )
 

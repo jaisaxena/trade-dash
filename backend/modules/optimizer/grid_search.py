@@ -55,12 +55,13 @@ def _run_single(
     overrides: dict[str, Any],
     initial_capital: float,
     interval: str,
+    interval_dfs: dict[str, pd.DataFrame] | None = None,
 ) -> dict:
     """Run one backtest with given param overrides.  Runs inside a joblib
     worker process — any exception is caught and returned as metadata so
     the whole search never aborts due to one bad combo."""
     try:
-        result = run_backtest(recipe, df, overrides, initial_capital, interval)
+        result = run_backtest(recipe, df, overrides, initial_capital, interval, interval_dfs)
         return {
             "params": overrides,
             "metrics": result["metrics"],
@@ -83,6 +84,7 @@ def grid_search(
     n_jobs: int = -1,
     max_random: int | None = None,
     progress_callback: Callable[[dict], None] | None = None,
+    interval_dfs: dict[str, pd.DataFrame] | None = None,
 ) -> list[dict]:
     """Run a full grid (or random sample) search in parallel.
 
@@ -99,6 +101,7 @@ def grid_search(
         n_jobs: joblib parallelism (-1 = all cores)
         max_random: If set, sample this many combos randomly instead of full grid
         progress_callback: Called in the calling thread after each result arrives
+        interval_dfs: Pre-fetched higher-timeframe DataFrames for multi-TF strategies
 
     Returns:
         List of results sorted by Sharpe ratio (descending).
@@ -111,12 +114,9 @@ def grid_search(
     total = len(combos)
     log.info("Starting grid search: %d combinations, n_jobs=%d", total, n_jobs)
 
-    # return_as="generator_unordered" streams results as each worker completes.
-    # This lets us call progress_callback in real time rather than waiting for
-    # the whole batch, and avoids GIL contention (each job is a separate process).
     results: list[dict] = []
     gen = Parallel(n_jobs=n_jobs, return_as="generator_unordered", backend="loky")(
-        delayed(_run_single)(recipe, df, combo, initial_capital, interval)
+        delayed(_run_single)(recipe, df, combo, initial_capital, interval, interval_dfs)
         for combo in combos
     )
 

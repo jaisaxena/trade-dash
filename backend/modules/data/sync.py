@@ -160,16 +160,22 @@ def get_data_status() -> dict:
         intervals: dict[str, dict | None] = {}
         for kite_iv, label in display_intervals.items():
             try:
-                row = conn.execute(
-                    "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM candles "
+                cnt_row = conn.execute(
+                    "SELECT COUNT(*) FROM candles "
                     "WHERE instrument_token = ? AND interval = ?",
                     [token, kite_iv],
                 ).fetchone()
-                if row and row[0] > 0:
+                cnt = cnt_row[0] if cnt_row else 0
+                if cnt > 0:
+                    rng = conn.execute(
+                        "SELECT MIN(timestamp), MAX(timestamp) FROM candles "
+                        "WHERE instrument_token = ? AND interval = ?",
+                        [token, kite_iv],
+                    ).fetchone()
                     intervals[label] = {
-                        "count": row[0],
-                        "from":  str(row[1])[:10] if row[1] else None,
-                        "to":    str(row[2])[:10] if row[2] else None,
+                        "count": cnt,
+                        "from":  str(rng[0])[:10] if rng and rng[0] else None,
+                        "to":    str(rng[1])[:10] if rng and rng[1] else None,
                     }
                 else:
                     intervals[label] = None

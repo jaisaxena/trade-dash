@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { formatStrikeRef } from "@/lib/strikeLabels";
 import { createChart, AreaSeries, CandlestickSeries, createSeriesMarkers, type IChartApi } from "lightweight-charts";
 
 type Strategy = {
@@ -657,7 +658,7 @@ export default function BacktestPage() {
                         background: "var(--bg-elevated)", borderRadius: 4, marginBottom: 3,
                         color: leg.action === "BUY" ? "var(--green-hi)" : "var(--red-hi)",
                       }}>
-                        {leg.action} {leg.option_type} {leg.strike} × {leg.lots}L
+                        {leg.action} {leg.option_type} {formatStrikeRef(leg.strike)} × {leg.lots}L
                       </div>
                     ))}
                   </div>

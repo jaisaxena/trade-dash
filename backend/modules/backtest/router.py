@@ -13,6 +13,7 @@ from modules.strategy.models import StrategyRecipe
 from modules.data.downloader import get_candles
 from modules.data.sync import get_token
 from modules.backtest.engine import run_backtest, save_backtest_result, _NumpyEncoder
+from modules.strategy.builder import get_required_intervals
 import json
 
 
@@ -92,8 +93,14 @@ async def run(body: BacktestRequest):
             f"Go to the Data module and sync it first."
         )
 
+    interval_dfs: dict = {}
+    for iv in get_required_intervals(body.recipe):
+        htf_df = get_candles(token, iv, from_date=from_date, to_date=to_date)
+        if not htf_df.empty:
+            interval_dfs[iv] = htf_df
+
     kite_interval = INTERVAL_TO_KITE.get(body.interval, body.interval)
-    result = run_backtest(body.recipe, df, body.param_overrides, body.initial_capital, kite_interval)
+    result = run_backtest(body.recipe, df, body.param_overrides, body.initial_capital, kite_interval, interval_dfs)
     result_id = save_backtest_result(body.recipe.id, body.recipe.version, result)
     actual_from = str(df["timestamp"].min())[:10]
     actual_to = str(df["timestamp"].max())[:10]

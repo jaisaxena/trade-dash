@@ -13,7 +13,7 @@ from modules.feed.replay_feed import load_candles, get_current_candle, get_recen
 from modules.feed.live_feed import get_live_quote, get_live_candles, SPOT_TOKENS as LIVE_SPOT_TOKENS
 from modules.data.downloader import get_candles
 from modules.data.sync import get_token, SPOT_TOKENS
-from modules.strategy.builder import compile_direction_signal
+from modules.strategy.builder import compile_direction_signal, get_required_intervals
 from modules.vault.store import load_recipe
 from modules.data.instruments import get_expiries, get_option_instruments
 
@@ -385,8 +385,35 @@ async def analyze(strategy_id: str):
     if recipe is None:
         raise HTTPException(404, f"Strategy '{strategy_id}' not found in vault")
 
+    # Fetch higher-timeframe DataFrames for multi-TF indicators
+    interval_dfs: dict = {}
+    required = get_required_intervals(recipe)
+    if required:
+        if state.mode == "replay" and state.candles_df is not None:
+            end_ts = analysis_df["timestamp"].iloc[-1]
+            for iv in required:
+                if state.underlying in SPOT_TOKENS:
+                    try:
+                        token = get_token(state.underlying)
+                        htf = get_candles(token, iv)
+                        if not htf.empty:
+                            htf = htf[htf["timestamp"] <= end_ts].tail(500).reset_index(drop=True)
+                            if not htf.empty:
+                                interval_dfs[iv] = htf
+                    except Exception:
+                        pass
+        else:
+            for iv in required:
+                if state.underlying in LIVE_SPOT_TOKENS:
+                    try:
+                        htf = get_live_candles(state.underlying, iv, 500)
+                        if not htf.empty:
+                            interval_dfs[iv] = htf.tail(500).reset_index(drop=True)
+                    except Exception:
+                        pass
+
     try:
-        dir_signal = compile_direction_signal(recipe, analysis_df)
+        dir_signal = compile_direction_signal(recipe, analysis_df, interval_dfs=interval_dfs)
         direction = str(dir_signal.iloc[-1])  # "long", "short", or "neutral"
         verdict = direction.upper()  # "LONG", "SHORT", "NEUTRAL"
 

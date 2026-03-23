@@ -25,8 +25,9 @@ class LegAction(str, Enum):
 
 
 class StrikeRef(str, Enum):
-    """Strike selection relative to ATM.  ATM+0 = at the money,
-    ATM+1 = one strike OTM for CE (ITM for PE), etc."""
+    """Strike ladder vs ATM (stored as ATM±N). UI labels: ATM+0 = ATM,
+    ATM+k = k strikes OTM, ATM−k = k strikes ITM (for both CE and PE,
+    matching feed/backtest strike resolution)."""
     ATM_M5 = "ATM-5"
     ATM_M4 = "ATM-4"
     ATM_M3 = "ATM-3"
@@ -76,6 +77,7 @@ class IndicatorVar(BaseModel):
     name: str                              # e.g. "fast_ema"
     indicator: str                         # e.g. "EMA"
     params: dict[str, Any] = Field(default_factory=dict)  # e.g. {"period": 20}
+    interval: str | None = None            # e.g. "1h" — None = base interval
 
 
 class EntryCondition(BaseModel):

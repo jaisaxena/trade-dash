@@ -546,6 +546,7 @@ export default function OptimizerPage() {
   // ── submit ────────────────────────────────────────────────────────────────
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   async function handleRun() {
     if (!strategyId) return;
@@ -600,6 +601,28 @@ export default function OptimizerPage() {
       setSubmitError((e as Error).message);
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleCancel() {
+    setCancelling(true);
+    try {
+      if (runId) {
+        await api.post(`/api/optimizer/runs/${runId}/cancel`, {});
+      } else {
+        // No known run_id (e.g. restored from session but server restarted
+        // and the run is already orphaned) — nuke all stuck runs.
+        await api.post("/api/optimizer/cancel-all", {});
+      }
+    } catch {
+      // best-effort; if it fails the run is likely already gone
+    } finally {
+      sessionStorage.removeItem(SESSION_KEY);
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      setProgress((p) =>
+        p ? { ...p, status: "failed", error: "Cancelled by user" } : p
+      );
+      setCancelling(false);
     }
   }
 
@@ -781,6 +804,26 @@ export default function OptimizerPage() {
                 ? <><span className="spinner" /> {isRunning ? "Optimizing…" : "Starting…"}</>
                 : isDone ? "Run Again" : "Run Optimization"}
             </button>
+
+            {isRunning && (
+              <button
+                onClick={handleCancel}
+                disabled={cancelling}
+                style={{
+                  width: "100%", marginTop: 6,
+                  padding: "7px 0", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                  cursor: cancelling ? "not-allowed" : "pointer",
+                  border: "1px solid rgba(239,68,68,.4)",
+                  background: "rgba(239,68,68,.1)",
+                  color: "var(--red-hi)",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}
+              >
+                {cancelling
+                  ? <><span className="spinner" style={{ borderTopColor: "var(--red-hi)" }} /> Stopping…</>
+                  : "⏹ Force Stop"}
+              </button>
+            )}
 
             {submitError && (
               <p style={{ fontSize: 12, color: "var(--red-hi)", margin: "8px 0 0" }}>
