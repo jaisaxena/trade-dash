@@ -27,6 +27,7 @@ INTERVAL_MAP = {
     "1m": "minute",
     "5m": "5minute",
     "15m": "15minute",
+    "1h": "60minute",
     "day": "day",
 }
 
@@ -34,6 +35,7 @@ KITE_INTERVAL_MAP = {
     "1m": "minute",
     "5m": "5minute",
     "15m": "15minute",
+    "1h": "60minute",
     "day": "day",
 }
 
@@ -41,6 +43,7 @@ MAX_DAYS_PER_CALL = {
     "1m": 60,
     "5m": 100,
     "15m": 200,
+    "1h": 400,
     "day": 2000,
 }
 

@@ -25,7 +25,7 @@ const STATUS_COLOR: Record<string, string> = {
 };
 
 const UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"];
-const INTERVALS   = ["1m", "5m", "15m", "day"];
+const INTERVALS   = ["1m", "5m", "15m", "1h", "day"];
 const SPEEDS      = [0.5, 1, 2, 5, 10, 20];
 
 const MONITOR_INTERVALS: { label: string; ms: number }[] = [

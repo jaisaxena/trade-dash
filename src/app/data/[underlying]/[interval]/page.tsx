@@ -7,7 +7,7 @@ import { createChart, CandlestickSeries, HistogramSeries, type IChartApi } from 
 import { api } from "@/lib/api";
 
 const INTERVAL_LABELS: Record<string, string> = {
-  "1m": "1 Minute", "5m": "5 Minute", "15m": "15 Minute", "day": "Daily",
+  "1m": "1 Minute", "5m": "5 Minute", "15m": "15 Minute", "1h": "1 Hour", "day": "Daily",
 };
 
 const PERIODS = [

@@ -681,6 +681,7 @@ export default function OptimizerPage() {
               <option value="1m">1 minute</option>
               <option value="5m">5 minute</option>
               <option value="15m">15 minute</option>
+              <option value="1h">1 hour</option>
               <option value="day">Daily</option>
             </select>
 

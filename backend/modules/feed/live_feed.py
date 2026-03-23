@@ -29,6 +29,7 @@ KITE_INTERVAL_MAP: dict[str, str] = {
     "1m": "minute",
     "5m": "5minute",
     "15m": "15minute",
+    "1h": "60minute",
     "day": "day",
 }
 
@@ -36,6 +37,7 @@ _LOOKBACK_DAYS: dict[str, int] = {
     "1m": 3,
     "5m": 7,
     "15m": 14,
+    "1h": 30,
     "day": 365,
 }
 
@@ -43,6 +45,7 @@ _CACHE_TTL_SECS: dict[str, float] = {
     "1m": 15,
     "5m": 30,
     "15m": 60,
+    "1h": 120,
     "day": 300,
 }
 

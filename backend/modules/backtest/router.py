@@ -29,7 +29,7 @@ def _sanitize(obj):
 router = APIRouter()
 
 INTERVAL_TO_KITE = {
-    "1m": "minute", "5m": "5minute", "15m": "15minute", "day": "day",
+    "1m": "minute", "5m": "5minute", "15m": "15minute", "1h": "60minute", "day": "day",
 }
 
 

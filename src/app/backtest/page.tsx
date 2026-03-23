@@ -456,7 +456,7 @@ export default function BacktestPage() {
   const selectedRun = completedRuns.find((r) => r.id === selectedRunId);
 
   const INTERVAL_LABELS: Record<string, string> = {
-    "1m": "1 minute", "5m": "5 minute", "15m": "15 minute", "day": "Daily",
+    "1m": "1 minute", "5m": "5 minute", "15m": "15 minute", "1h": "1 hour", "day": "Daily",
   };
 
   return (
@@ -501,6 +501,7 @@ export default function BacktestPage() {
               <option value="1m">1 min</option>
               <option value="5m">5 min</option>
               <option value="15m">15 min</option>
+              <option value="1h">1 hour</option>
               <option value="day">Daily</option>
             </select>
 

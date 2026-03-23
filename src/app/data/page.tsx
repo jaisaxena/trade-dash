@@ -10,6 +10,7 @@ const ALL_INTERVALS = [
   { value: "1m",  label: "1 min" },
   { value: "5m",  label: "5 min" },
   { value: "15m", label: "15 min" },
+  { value: "1h",  label: "1 hour" },
   { value: "day", label: "Daily" },
 ];
 
@@ -563,7 +564,7 @@ export default function DataPage() {
                       <span style={{ fontWeight: 700, fontSize: 14 }}>{underlying}</span>
                       <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{info.display_name}</span>
                     </div>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8 }}>
                       {Object.entries(info.intervals).map(([ivLabel, ivData]) => (
                         <div
                           key={ivLabel}

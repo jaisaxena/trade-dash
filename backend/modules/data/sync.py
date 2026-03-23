@@ -148,10 +148,11 @@ def get_data_status() -> dict:
     """Return per-underlying, per-interval candle availability from DuckDB."""
     conn = get_conn()
     display_intervals = {
-        "minute":   "1m",
-        "5minute":  "5m",
-        "15minute": "15m",
-        "day":      "day",
+        "minute":    "1m",
+        "5minute":   "5m",
+        "15minute":  "15m",
+        "60minute":  "1h",
+        "day":       "day",
     }
     result: dict[str, dict] = {}
     for underlying, cfg in UNDERLYING_CONFIG.items():
